@@ -308,7 +308,7 @@ def _collect_entries_from_miniflux(
     Returns:
         List of entries matching the filters
     """
-    from api.miniflux_client import MinifluxClient
+    from miniflux_client import MinifluxClient
 
     client = MinifluxClient(base_url=url, api_token=token)
     try:
