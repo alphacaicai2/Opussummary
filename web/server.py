@@ -570,6 +570,21 @@ class TaskOut(TaskBase):
         from_attributes = True
 
 
+class TaskLatestBriefing(BaseModel):
+    """Model for latest briefing status of a task."""
+    briefing_id: int | None = None
+    status: str | None = None  # success, degraded, failed
+    error_message: str | None = None
+    article_count: int = 0
+    created_at: str | None = None
+    sent_successfully: bool = False
+
+
+class TaskWithStatus(TaskOut):
+    """Task output with latest briefing status."""
+    latest_briefing: TaskLatestBriefing | None = None
+
+
 class GenerateRequest(BaseModel):
     """Model for briefing generation request."""
     task_id: int | None = Field(default=None, description="Task ID to use as template")
@@ -1701,12 +1716,47 @@ def create_app() -> FastAPI:
     # Task API
     # =========================================================================
 
-    @app.get("/api/tasks", response_model=list[TaskOut])
-    def list_tasks() -> list[TaskOut]:
-        """List all briefing tasks."""
+    def _get_latest_briefing_for_task(conn: sqlite3.Connection, task_id: int) -> TaskLatestBriefing | None:
+        """Get the latest briefing for a task."""
+        row = conn.execute(
+            """
+            SELECT id, status, error_message, article_count, created_at, sent_to_json
+            FROM briefings
+            WHERE task_id = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (task_id,)
+        ).fetchone()
+        if row is None:
+            return None
+
+        sent_to = _json_loads(row["sent_to_json"], [])
+        sent_successfully = any(s.get("success") for s in sent_to) if sent_to else False
+
+        return TaskLatestBriefing(
+            briefing_id=row["id"],
+            status=row["status"],
+            error_message=row["error_message"],
+            article_count=row["article_count"] or 0,
+            created_at=row["created_at"],
+            sent_successfully=sent_successfully,
+        )
+
+    @app.get("/api/tasks", response_model=list[TaskWithStatus])
+    def list_tasks() -> list[TaskWithStatus]:
+        """List all briefing tasks with their latest briefing status."""
+        results: list[TaskWithStatus] = []
         with _get_conn() as conn:
             rows = conn.execute("SELECT * FROM tasks ORDER BY id DESC").fetchall()
-        return [_task_row_to_model(row) for row in rows]
+            for row in rows:
+                task = _task_row_to_model(row)
+                latest_briefing = _get_latest_briefing_for_task(conn, task.id)
+                results.append(TaskWithStatus(
+                    **task.model_dump(),
+                    latest_briefing=latest_briefing,
+                ))
+        return results
 
     @app.post("/api/tasks", response_model=TaskOut, status_code=201)
     def create_task(payload: TaskCreate) -> TaskOut:
