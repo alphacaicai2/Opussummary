@@ -185,6 +185,7 @@ def _fetch_custom_template_from_db(template_id: str) -> dict[str, Any] | None:
         Contains: id, name, description, system_prompt, user_prompt_template,
                   required_sections (as list), is_builtin
     """
+    logger.debug("Fetching custom template '%s' from database (path: %s)", template_id, _DB_PATH)
     try:
         with _get_db_connection() as conn:
             row = conn.execute(
@@ -197,6 +198,7 @@ def _fetch_custom_template_from_db(template_id: str) -> dict[str, Any] | None:
                 (template_id,),
             ).fetchone()
             if row is None:
+                logger.debug("No custom template found for id='%s'", template_id)
                 return None
 
             # Parse required_sections JSON
@@ -206,6 +208,13 @@ def _fetch_custom_template_from_db(template_id: str) -> dict[str, Any] | None:
             except (json.JSONDecodeError, TypeError):
                 pass
 
+            logger.info(
+                "Found custom template '%s' in database: name='%s', system_prompt_len=%d, user_prompt_len=%d",
+                row["id"],
+                row["name"],
+                len(row["system_prompt"] or ""),
+                len(row["user_prompt_template"] or ""),
+            )
             return {
                 "id": row["id"],
                 "name": row["name"],
