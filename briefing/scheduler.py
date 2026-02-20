@@ -910,6 +910,15 @@ class BriefingScheduler:
         generator = self._get_generator(task)
 
         # Step 5: Create BriefingGenerateRequest and generate
+        # Dynamic budget: entries * 30000 chars per entry
+        prompt_char_budget = len(entries) * 30000
+        logger.info(
+            "Task %s: dynamic prompt_char_budget = %d entries * 30000 = %d chars",
+            task.id,
+            len(entries),
+            prompt_char_budget,
+        )
+
         try:
             from briefing.generator import BriefingGenerateRequest, BriefingTemplate
 
@@ -925,6 +934,7 @@ class BriefingScheduler:
                 timezone=timezone_name,
                 time_range_hours=time_range_hours,
                 output_format="markdown",
+                prompt_char_budget=prompt_char_budget,
             )
 
             result = generator.generate(request)
