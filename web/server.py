@@ -37,6 +37,7 @@ from briefing.templates import (
 from llm.client import LLMClient
 from miniflux_client import MinifluxClient
 from sender.discord import DiscordSender, DiscordSenderError
+from briefing.scheduler import BriefingScheduler
 
 # =============================================================================
 # Configuration & Constants
@@ -1437,6 +1438,24 @@ def test_miniflux_connection(payload: MinifluxTestRequest) -> dict[str, Any]:
 # FastAPI Application
 # =============================================================================
 
+from contextlib import asynccontextmanager
+
+# Global scheduler instance
+_app_scheduler: BriefingScheduler | None = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    global _app_scheduler
+    logger.info("Initializing BriefingScheduler...")
+    _app_scheduler = BriefingScheduler()
+    _app_scheduler.start()
+    yield
+    # Shutdown
+    if _app_scheduler:
+        logger.info("Shutting down BriefingScheduler...")
+        _app_scheduler.shutdown(wait=False)
+
 def create_app() -> FastAPI:
     """Create and configure FastAPI application."""
     bootstrap()
@@ -1445,6 +1464,7 @@ def create_app() -> FastAPI:
         title="OpusBrief Web Admin",
         version="0.1.0",
         description="Web administration interface for OpusBrief RSS briefing system",
+        lifespan=lifespan,
     )
 
     # CORS middleware - restricted to localhost for security
@@ -1726,6 +1746,10 @@ def create_app() -> FastAPI:
 
         with _get_conn() as conn:
             row = conn.execute("SELECT * FROM tasks WHERE id = ?", (new_id,)).fetchone()
+            
+        if _app_scheduler:
+            _app_scheduler.reload()
+            
         return _task_row_to_model(row)
 
     @app.put("/api/tasks/{task_id}", response_model=TaskOut)
@@ -1762,6 +1786,10 @@ def create_app() -> FastAPI:
             )
             conn.commit()
             row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            
+        if _app_scheduler:
+            _app_scheduler.reload()
+            
         return _task_row_to_model(row)
 
     @app.delete("/api/tasks/{task_id}")
@@ -1773,6 +1801,10 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
             conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
             conn.commit()
+            
+        if _app_scheduler:
+            _app_scheduler.reload()
+            
         return {"ok": True, "id": task_id}
 
     # =========================================================================
