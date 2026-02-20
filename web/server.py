@@ -585,6 +585,12 @@ class TaskWithStatus(TaskOut):
     latest_briefing: TaskLatestBriefing | None = None
 
 
+class PreviewCountRequest(BaseModel):
+    """Model for previewing entry count."""
+    category_ids: list[int] | None = Field(default=None, description="Category IDs to filter (None = all)")
+    time_range_hours: int | None = Field(default=24, ge=1, le=168, description="Hours to look back")
+
+
 class GenerateRequest(BaseModel):
     """Model for briefing generation request."""
     task_id: int | None = Field(default=None, description="Task ID to use as template")
@@ -1882,11 +1888,32 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
             conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
             conn.commit()
-            
+
         if _app_scheduler:
             _app_scheduler.reload_enabled_tasks()
-            
+
         return {"ok": True, "id": task_id}
+
+    @app.post("/api/preview-count")
+    def preview_entry_count(payload: PreviewCountRequest) -> dict[str, Any]:
+        """
+        Preview the number of entries that match the given filters.
+
+        This is used in the task editor to show users how many articles
+        will be included before they save the task.
+        """
+        url, token = _resolve_miniflux_config()
+        entries = _collect_entries(
+            url=url,
+            token=token,
+            category_ids=payload.category_ids or [],
+            time_range_hours=payload.time_range_hours or 24,
+        )
+        return {
+            "count": len(entries),
+            "time_range_hours": payload.time_range_hours or 24,
+            "category_ids": payload.category_ids or [],
+        }
 
     # =========================================================================
     # Generate API

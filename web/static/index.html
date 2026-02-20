@@ -401,6 +401,21 @@
                         <div id="task-categories" class="grid grid-cols-2 gap-2 max-h-32 overflow-y-auto bg-gray-700/50 rounded-lg p-3">
                             <p class="text-gray-500 text-sm col-span-2">请先配置 Miniflux 连接</p>
                         </div>
+                        <p class="text-xs text-gray-500 mt-1">不选择任何分组 = 选择全部分组</p>
+                    </div>
+                    <!-- 文章数量预览 -->
+                    <div class="bg-gray-700/30 rounded-lg p-3 border border-gray-600/50">
+                        <div class="flex items-center justify-between">
+                            <span class="text-sm text-gray-400">匹配文章数量</span>
+                            <button type="button" id="preview-count-btn" onclick="previewEntryCount()"
+                                class="text-xs bg-primary/20 text-primary hover:bg-primary/30 rounded px-3 py-1 transition-colors">
+                                刷新预览
+                            </button>
+                        </div>
+                        <div id="preview-count-result" class="mt-2 text-center">
+                            <span class="text-2xl font-bold text-gray-300">-</span>
+                            <span class="text-sm text-gray-500 ml-1">篇</span>
+                        </div>
                     </div>
                 </div>
 
@@ -1042,12 +1057,30 @@
             }
 
             toggleScheduleTimeField();
+
+            // Trigger preview count after categories are loaded and set
+            setTimeout(() => previewEntryCount(), 150);
         }
 
         function hideTaskModal() {
             document.getElementById('task-modal').classList.add('hidden');
             document.getElementById('task-modal').classList.remove('flex');
         }
+
+        // Event listeners for auto-refreshing preview count
+        document.getElementById('task-time-range').addEventListener('change', () => {
+            // Debounce to avoid rapid API calls
+            clearTimeout(window._previewCountTimeout);
+            window._previewCountTimeout = setTimeout(() => previewEntryCount(), 300);
+        });
+
+        // Use event delegation for category checkboxes (they're dynamically generated)
+        document.getElementById('task-categories').addEventListener('change', (e) => {
+            if (e.target.type === 'checkbox') {
+                clearTimeout(window._previewCountTimeout);
+                window._previewCountTimeout = setTimeout(() => previewEntryCount(), 300);
+            }
+        });
 
         function toggleScheduleTimeField() {
             const schedule = document.getElementById('task-schedule').value;
@@ -1091,6 +1124,50 @@
             }
 
             return { frequency: 'daily', time: '09:00' };
+        }
+
+        async function previewEntryCount() {
+            const timeRangeInput = document.getElementById('task-time-range');
+            const time_range_hours = parseInt(timeRangeInput.value) || 24;
+            const category_ids = Array.from(document.querySelectorAll('#task-categories input:checked')).map(cb => parseInt(cb.value));
+
+            const resultEl = document.getElementById('preview-count-result');
+            const btn = document.getElementById('preview-count-btn');
+
+            // Show loading state
+            resultEl.innerHTML = '<svg class="w-5 h-5 spinner inline text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>';
+            btn.disabled = true;
+
+            try {
+                const response = await fetch('/api/preview-count', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        time_range_hours,
+                        category_ids: category_ids.length > 0 ? category_ids : null
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+
+                const data = await response.json();
+                const count = data.count || 0;
+
+                // Update display with color based on count
+                let colorClass = 'text-gray-300';
+                if (count === 0) colorClass = 'text-red-400';
+                else if (count < 10) colorClass = 'text-yellow-400';
+                else if (count >= 50) colorClass = 'text-green-400';
+
+                resultEl.innerHTML = `<span class="text-2xl font-bold ${colorClass}">${count}</span><span class="text-sm text-gray-500 ml-1">篇</span>`;
+            } catch (error) {
+                console.error('Preview count error:', error);
+                resultEl.innerHTML = '<span class="text-sm text-red-400">加载失败</span>';
+            } finally {
+                btn.disabled = false;
+            }
         }
 
         async function saveTask() {
