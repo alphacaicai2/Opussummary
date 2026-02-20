@@ -1256,6 +1256,23 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
 
                 # Create briefing generator and request
                 generator = BriefingGenerator(llm_client=llm_client)
+
+                # Check for custom template in database
+                custom_template_kwargs = {}
+                template_id = raw_template.lower() if raw_template else "general"
+                with _get_conn() as conn:
+                    custom_row = conn.execute(
+                        "SELECT system_prompt, user_prompt_template, required_sections FROM custom_templates WHERE id = ?",
+                        (template_id,),
+                    ).fetchone()
+                    if custom_row:
+                        logger.info("Using custom template '%s' from database", template_id)
+                        custom_template_kwargs = {
+                            "custom_system_prompt": custom_row["system_prompt"],
+                            "custom_user_prompt_template": custom_row["user_prompt_template"],
+                            "custom_required_sections": tuple(json.loads(custom_row["required_sections"] or "[]")),
+                        }
+
                 request = BriefingGenerateRequest(
                     template=resolved_template,
                     articles=articles,
@@ -1263,6 +1280,7 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                     time_range_hours=time_range_hours,
                     output_format="markdown",
                     article_content_max_length=MAX_ARTICLE_CONTENT_CHARS,  # Pass limit to generator
+                    **custom_template_kwargs,
                 )
 
                 # Generate briefing
