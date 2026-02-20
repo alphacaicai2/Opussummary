@@ -95,8 +95,8 @@ For more information, visit: https://github.com/your-repo/opusbrief
     # Global options
     parser.add_argument(
         "--host",
-        default=os.getenv("WEB_HOST", "127.0.0.1"),
-        help="Web server host (default: 127.0.0.1)",
+        default=os.getenv("WEB_HOST", "0.0.0.0"),
+        help="Web server host (default: 0.0.0.0)",
     )
     parser.add_argument(
         "--port",
