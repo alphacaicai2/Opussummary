@@ -168,6 +168,89 @@ def _fetch_default_webhook_from_db() -> dict[str, Any] | None:
         return None
 
 
+def _resolve_llm_config_for_task(llm_config_id: int | None) -> dict[str, Any] | None:
+    """
+    Resolve LLM configuration from database for a task.
+
+    Priority:
+    1. Explicit llm_config_id (if provided)
+    2. Default config (is_default = 1)
+    3. First available config as fallback
+
+    Args:
+        llm_config_id: Optional explicit config ID from task
+
+    Returns:
+        Dictionary with LLM config, or None if no config exists
+    """
+    try:
+        with _get_db_connection() as conn:
+            # If explicit ID provided, look it up
+            if llm_config_id is not None:
+                row = conn.execute(
+                    """
+                    SELECT id, provider, base_url, api_key, model
+                    FROM llm_configs
+                    WHERE id = ?
+                    """,
+                    (llm_config_id,),
+                ).fetchone()
+                if row is not None:
+                    return {
+                        "id": row["id"],
+                        "provider": row["provider"],
+                        "base_url": row["base_url"],
+                        "api_key": row["api_key"],
+                        "model": row["model"],
+                    }
+                logger.warning(
+                    "LLM config %d not found, falling back to default",
+                    llm_config_id,
+                )
+
+            # Try default config
+            row = conn.execute(
+                """
+                SELECT id, provider, base_url, api_key, model
+                FROM llm_configs
+                WHERE is_default = 1
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is not None:
+                return {
+                    "id": row["id"],
+                    "provider": row["provider"],
+                    "base_url": row["base_url"],
+                    "api_key": row["api_key"],
+                    "model": row["model"],
+                }
+
+            # Fall back to first available config
+            row = conn.execute(
+                """
+                SELECT id, provider, base_url, api_key, model
+                FROM llm_configs
+                ORDER BY id
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is not None:
+                return {
+                    "id": row["id"],
+                    "provider": row["provider"],
+                    "base_url": row["base_url"],
+                    "api_key": row["api_key"],
+                    "model": row["model"],
+                }
+
+            logger.warning("No LLM configuration found in database")
+            return None
+    except Exception as e:
+        logger.error("Failed to resolve LLM config: %s", e)
+        return None
+
+
 # =============================================================================
 # Constants
 # =============================================================================
@@ -637,7 +720,7 @@ class BriefingScheduler:
         Raises:
             TaskExecutionError: If briefing generation fails.
         """
-        generator = self._get_generator()
+        generator = self._get_generator(task)
 
         # Try different method names for compatibility
         method_names = ["generate_for_task", "generate_briefing", "generate"]
@@ -658,18 +741,68 @@ class BriefingScheduler:
 
         raise TaskExecutionError("No compatible generator method found")
 
-    def _get_generator(self) -> Any:
-        """Get or create the briefing generator instance."""
-        if self._generator is None:
-            try:
-                from briefing.generator import BriefingGenerator
+    def _get_generator(self, task: Any) -> Any:
+        """
+        Get or create the briefing generator instance for a task.
 
-                self._generator = BriefingGenerator()
-            except ImportError as e:
-                raise TaskExecutionError(
-                    f"Failed to import BriefingGenerator: {e}"
-                ) from e
-        return self._generator
+        Creates a new generator for each task execution to ensure
+        the correct LLM client is used based on the task's configuration.
+
+        Args:
+            task: The briefing task configuration (must have llm_config_id).
+
+        Returns:
+            A BriefingGenerator instance configured for the task.
+
+        Raises:
+            TaskExecutionError: If LLM config is missing or generator creation fails.
+        """
+        # Get LLM config ID from task
+        llm_config_id = getattr(task, "llm_config_id", None)
+
+        # Resolve LLM configuration
+        llm_config = _resolve_llm_config_for_task(llm_config_id)
+        if llm_config is None:
+            raise TaskExecutionError(
+                f"No LLM configuration available for task {getattr(task, 'id', 'unknown')}"
+            )
+
+        # Determine API style based on provider
+        provider = (llm_config.get("provider") or "").strip().lower()
+        api_style = "anthropic" if provider == "anthropic" else "openai"
+
+        try:
+            from llm.client import LLMClient
+            from briefing.generator import BriefingGenerator
+
+            # Initialize LLM client
+            llm_client = LLMClient(
+                base_url=llm_config["base_url"],
+                api_key=llm_config["api_key"],
+                model=llm_config["model"],
+                provider_id=provider or "openai",
+                api_style=api_style,
+            )
+
+            # Create generator with the LLM client
+            generator = BriefingGenerator(llm_client=llm_client)
+            logger.info(
+                "Created BriefingGenerator for task %s with LLM config %d (%s/%s)",
+                getattr(task, "id", "unknown"),
+                llm_config["id"],
+                provider or "openai",
+                llm_config["model"],
+            )
+            return generator
+
+        except ImportError as e:
+            raise TaskExecutionError(
+                f"Failed to import BriefingGenerator: {e}"
+            ) from e
+        except Exception as e:
+            raise TaskExecutionError(
+                f"Failed to create BriefingGenerator: {e}"
+            ) from e
 
     @staticmethod
     def _call_generator_method(method: Callable[..., Any], task: Any) -> Any:
