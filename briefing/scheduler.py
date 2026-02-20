@@ -10,9 +10,13 @@ Responsible for:
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import re
+import sqlite3
+from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from threading import RLock
 from typing import TYPE_CHECKING, Any, Callable, Protocol, runtime_checkable
 
@@ -26,6 +30,142 @@ if TYPE_CHECKING:
     from zoneinfo import ZoneInfo
 
 logger = logging.getLogger("opus.briefing.scheduler")
+
+# =============================================================================
+# Database Path (same as web/server.py)
+# =============================================================================
+
+_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "briefings.db"
+
+
+# =============================================================================
+# WebTask Dataclass (for tasks from web/server.py 'tasks' table)
+# =============================================================================
+
+@dataclass
+class WebTask:
+    """Task data from web/server.py 'tasks' table."""
+
+    id: int
+    name: str
+    template: str = "general"
+    schedule: str = "manual"
+    cron_expr: str | None = None
+    timezone: str = "Asia/Shanghai"
+    categories: list[int] = field(default_factory=list)
+    time_range_hours: int = 24
+    llm_config_id: int | None = None
+    webhook_ids: list[int] = field(default_factory=list)
+    enabled: bool = True
+    last_run_at: str | None = None
+
+    def get_webhook_ids(self) -> list[int]:
+        """Return webhook IDs for this task."""
+        return self.webhook_ids
+
+
+def _get_db_connection() -> sqlite3.Connection:
+    """Get database connection with row factory."""
+    _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _fetch_enabled_tasks_from_db() -> list[WebTask]:
+    """Fetch all enabled tasks from the 'tasks' table."""
+    tasks: list[WebTask] = []
+    try:
+        with _get_db_connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM tasks WHERE enabled = 1 ORDER BY id"
+            ).fetchall()
+            for row in rows:
+                tasks.append(WebTask(
+                    id=row["id"],
+                    name=row["name"],
+                    template=row["template"] or "general",
+                    schedule=row["schedule"] or "manual",
+                    cron_expr=row["cron_expr"],
+                    timezone=row["timezone"] or "Asia/Shanghai",
+                    categories=json.loads(row["categories_json"] or "[]"),
+                    time_range_hours=row["time_range_hours"] or 24,
+                    llm_config_id=row["llm_config_id"],
+                    webhook_ids=json.loads(row["webhook_ids_json"] or "[]"),
+                    enabled=bool(row["enabled"]),
+                    last_run_at=row["last_run_at"],
+                ))
+    except Exception as e:
+        logger.error("Failed to fetch tasks from database: %s", e)
+    return tasks
+
+
+def _fetch_task_by_id_from_db(task_id: int) -> WebTask | None:
+    """Fetch a single task by ID from the 'tasks' table."""
+    try:
+        with _get_db_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            return WebTask(
+                id=row["id"],
+                name=row["name"],
+                template=row["template"] or "general",
+                schedule=row["schedule"] or "manual",
+                cron_expr=row["cron_expr"],
+                timezone=row["timezone"] or "Asia/Shanghai",
+                categories=json.loads(row["categories_json"] or "[]"),
+                time_range_hours=row["time_range_hours"] or 24,
+                llm_config_id=row["llm_config_id"],
+                webhook_ids=json.loads(row["webhook_ids_json"] or "[]"),
+                enabled=bool(row["enabled"]),
+                last_run_at=row["last_run_at"],
+            )
+    except Exception as e:
+        logger.error("Failed to fetch task %d from database: %s", task_id, e)
+        return None
+
+
+def _fetch_webhook_by_id_from_db(webhook_id: int) -> dict[str, Any] | None:
+    """Fetch a webhook by ID from the 'webhooks' table."""
+    try:
+        with _get_db_connection() as conn:
+            row = conn.execute(
+                "SELECT id, type, url, enabled FROM webhooks WHERE id = ?", (webhook_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "id": row["id"],
+                "type": row["type"] or "discord",
+                "url": row["url"],
+                "enabled": bool(row["enabled"]),
+            }
+    except Exception as e:
+        logger.error("Failed to fetch webhook %d from database: %s", webhook_id, e)
+        return None
+
+
+def _fetch_default_webhook_from_db() -> dict[str, Any] | None:
+    """Fetch the default webhook from the 'webhooks' table."""
+    try:
+        with _get_db_connection() as conn:
+            row = conn.execute(
+                "SELECT id, type, url, enabled FROM webhooks WHERE is_default = 1 AND enabled = 1 LIMIT 1"
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "id": row["id"],
+                "type": row["type"] or "discord",
+                "url": row["url"],
+                "enabled": bool(row["enabled"]),
+            }
+    except Exception as e:
+        logger.error("Failed to fetch default webhook from database: %s", e)
+        return None
 
 
 # =============================================================================
@@ -347,18 +487,10 @@ class BriefingScheduler:
         Returns:
             Tuple of (loaded_count, removed_count).
         """
-        try:
-            from database import list_briefing_tasks
-        except ImportError as e:
-            logger.error("Failed to import database module: %s", e)
-            return 0, 0
-
-        # Fetch enabled tasks from database
-        try:
-            tasks = list_briefing_tasks(enabled=True, limit=10000, offset=0)
-        except Exception as e:
-            logger.error("Failed to fetch tasks from database: %s", e)
-            return 0, 0
+        # Fetch enabled tasks from 'tasks' table (web/server.py)
+        tasks = _fetch_enabled_tasks_from_db()
+        if not tasks:
+            logger.info("No enabled tasks found in database")
 
         desired_task_ids = {task.id for task in tasks}
 
@@ -443,14 +575,8 @@ class BriefingScheduler:
         """
         logger.info("Executing scheduled task: id=%s", task_id)
 
-        try:
-            from database import get_briefing_task
-        except ImportError as e:
-            logger.error("Failed to import database module: %s", e)
-            return
-
-        # Fetch fresh task data from database
-        task = get_briefing_task(task_id)
+        # Fetch fresh task data from 'tasks' table (web/server.py)
+        task = _fetch_task_by_id_from_db(task_id)
         if task is None:
             logger.warning("Task %s not found in database, skipping", task_id)
             return
@@ -590,20 +716,14 @@ class BriefingScheduler:
         Returns:
             Number of webhooks that received the content.
         """
-        try:
-            from database import get_default_webhook, get_webhook
-        except ImportError as e:
-            logger.error("Failed to import database module: %s", e)
-            return 0
-
         # Get webhook IDs from task
         webhook_ids = task.get_webhook_ids() if hasattr(task, "get_webhook_ids") else []
 
         # Fall back to default webhook
         if not webhook_ids:
-            default_webhook = get_default_webhook()
+            default_webhook = _fetch_default_webhook_from_db()
             if default_webhook:
-                webhook_ids = [default_webhook.id]
+                webhook_ids = [default_webhook["id"]]
 
         if not webhook_ids:
             logger.warning("Task %s has no webhooks configured", task.id)
@@ -618,16 +738,16 @@ class BriefingScheduler:
                 continue
             seen_ids.add(webhook_id)
 
-            webhook = get_webhook(webhook_id)
+            webhook = _fetch_webhook_by_id_from_db(webhook_id)
             if webhook is None:
                 logger.warning("Webhook %s not found, skipping", webhook_id)
                 continue
 
-            if not webhook.url:
+            if not webhook["url"]:
                 logger.warning("Webhook %s has empty URL, skipping", webhook_id)
                 continue
 
-            webhook_type = (webhook.type or "").lower()
+            webhook_type = (webhook["type"] or "").lower()
             if webhook_type != "discord":
                 logger.warning(
                     "Webhook %s has unsupported type '%s', skipping",
@@ -639,7 +759,7 @@ class BriefingScheduler:
             # Send via Discord sender
             sender = None
             try:
-                sender = self._create_sender(webhook.url)
+                sender = self._create_sender(webhook["url"])
                 messages_sent = sender.send_briefing(content)
                 if messages_sent > 0:
                     sent_count += 1
@@ -836,10 +956,10 @@ class BriefingScheduler:
         Resolve a task from a task object or ID.
 
         Args:
-            task_or_id: BriefingTask instance or integer ID.
+            task_or_id: WebTask instance or integer ID.
 
         Returns:
-            A BriefingTask instance.
+            A WebTask instance.
 
         Raises:
             KeyError: If the task cannot be found.
@@ -847,15 +967,11 @@ class BriefingScheduler:
         if hasattr(task_or_id, "id") and hasattr(task_or_id, "schedule"):
             return task_or_id
 
-        try:
-            from database import get_briefing_task
-
-            task = get_briefing_task(int(task_or_id))
-            if task is None:
-                raise KeyError(f"Task {task_or_id} not found in database")
-            return task
-        except ImportError as e:
-            raise KeyError(f"Cannot resolve task: database module not available: {e}") from e
+        # Fetch from 'tasks' table (web/server.py)
+        task = _fetch_task_by_id_from_db(int(task_or_id))
+        if task is None:
+            raise KeyError(f"Task {task_or_id} not found in database")
+        return task
 
     @staticmethod
     def _validate_timezone(tz_name: str) -> str:
