@@ -548,19 +548,69 @@ class LLMClient:
             "max_tokens": max_tokens,
         }
 
-        logger.debug(
-            "发起 OpenAI 兼容请求: model=%s, messages_count=%d",
+        # Calculate total prompt size for logging
+        total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+        system_chars = sum(
+            len(str(m.get("content", "")))
+            for m in messages
+            if m.get("role") == "system"
+        )
+        user_chars = total_chars - system_chars
+
+        logger.info(
+            "=== LLM API Call ===\n"
+            "  Provider: %s\n"
+            "  Model: %s\n"
+            "  Base URL: %s\n"
+            "  Endpoint: POST %s/chat/completions\n"
+            "  Messages: %d (system=%d chars, user=%d chars, total=%d chars)\n"
+            "  Temperature: %.2f\n"
+            "  Max Tokens: %d",
+            self.provider_id,
             self.model,
+            self.base_url,
+            self.base_url,
             len(messages),
+            system_chars,
+            user_chars,
+            total_chars,
+            temperature,
+            max_tokens,
         )
 
         try:
             resp = await self._client.post("/chat/completions", json=payload)
+            logger.info(
+                "=== LLM API Response ===\n"
+                "  Status: %d\n"
+                "  Model Used: %s",
+                resp.status_code,
+                self.model,
+            )
         except httpx.HTTPError as exc:
+            logger.error(
+                "=== LLM API Network Error ===\n"
+                "  Error: %s\n"
+                "  Model: %s",
+                exc,
+                self.model,
+            )
             raise LLMRequestError(
                 f"网络请求失败: {exc}",
                 provider_id=self.provider_id,
             ) from exc
+
+        # Log error response details before raising
+        if resp.status_code >= 400:
+            logger.error(
+                "=== LLM API Error Response ===\n"
+                "  Status: %d\n"
+                "  Model: %s\n"
+                "  Response Body: %s",
+                resp.status_code,
+                self.model,
+                resp.text[:1000] if resp.text else "(empty)",
+            )
 
         self._raise_for_status(resp)
 
@@ -972,6 +1022,25 @@ class LLMClient:
         Returns:
             str: 模型生成的回复文本
         """
+        # Log prompt sizes for debugging
+        sys_len = len(system_prompt) if system_prompt else 0
+        user_len = len(user_prompt) if user_prompt else 0
+        logger.info(
+            "=== BriefingGenerator.complete() ===\n"
+            "  Model: %s\n"
+            "  System Prompt: %d chars\n"
+            "  User Prompt: %d chars\n"
+            "  Total Prompt: %d chars\n"
+            "  Temperature: %.2f\n"
+            "  Max Tokens: %d",
+            self.model,
+            sys_len,
+            user_len,
+            sys_len + user_len,
+            temperature,
+            max_tokens,
+        )
+
         messages: list[ChatMessage] = []
 
         if system_prompt and system_prompt.strip():

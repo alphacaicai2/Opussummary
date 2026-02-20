@@ -1207,6 +1207,23 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                 provider = str(llm_row["provider"] or "").strip().lower()
                 api_style = "anthropic" if provider == "anthropic" else "openai"
 
+                # Log the LLM configuration being used
+                logger.info(
+                    "=== LLM Configuration ===\n"
+                    "  Config ID: %s\n"
+                    "  Config Name: %s\n"
+                    "  Provider: %s\n"
+                    "  Model: %s\n"
+                    "  Base URL: %s\n"
+                    "  API Style: %s",
+                    llm_row.get("id"),
+                    llm_row.get("name"),
+                    provider,
+                    llm_row["model"],
+                    llm_row["base_url"],
+                    api_style,
+                )
+
                 # Initialize LLM client
                 llm_client = LLMClient(
                     base_url=str(llm_row["base_url"]),
@@ -1225,10 +1242,12 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                 # Articles are already sorted by recency in _collect_entries
                 articles = _prepare_articles_for_briefing(entries)
 
-                # Dynamic budget: entries * 30000 chars per entry
-                prompt_char_budget = len(entries) * 30000
+                # Dynamic budget: entries * 25000 chars per entry
+                # Note: Qwen2.5-72B-Instruct has 32K token limit.
+                # Using 25000 chars/entry gives safe margin (roughly 1 token ≈ 2-3 chars for mixed content)
+                prompt_char_budget = len(entries) * 25000
                 logger.info(
-                    "Dynamic prompt_char_budget = %d entries * 30000 = %d chars",
+                    "Dynamic prompt_char_budget = %d entries * 25000 = %d chars",
                     len(entries),
                     prompt_char_budget,
                 )
