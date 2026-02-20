@@ -2211,6 +2211,7 @@ def create_app() -> FastAPI:
 
         with _get_conn() as conn:
             conn.execute("DELETE FROM custom_templates WHERE id = ?", (template_id,))
+            conn.commit()
 
         return {"message": f"Template '{template_id}' reset to default"}
 
