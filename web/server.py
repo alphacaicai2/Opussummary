@@ -1743,7 +1743,7 @@ def create_app() -> FastAPI:
             row = conn.execute("SELECT * FROM tasks WHERE id = ?", (new_id,)).fetchone()
             
         if _app_scheduler:
-            _app_scheduler.reload()
+            _app_scheduler.reload_enabled_tasks()
             
         return _task_row_to_model(row)
 
@@ -1783,7 +1783,7 @@ def create_app() -> FastAPI:
             row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
             
         if _app_scheduler:
-            _app_scheduler.reload()
+            _app_scheduler.reload_enabled_tasks()
             
         return _task_row_to_model(row)
 
@@ -1798,7 +1798,7 @@ def create_app() -> FastAPI:
             conn.commit()
             
         if _app_scheduler:
-            _app_scheduler.reload()
+            _app_scheduler.reload_enabled_tasks()
             
         return {"ok": True, "id": task_id}
 
