@@ -1139,9 +1139,8 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
         HTTPException: If task not found or explicit LLM config not found
     """
     # Token limit constants (prevent LLM context overflow)
-    MAX_LLM_ARTICLES = 25  # Reduced from 50 to prevent token overflow
     MAX_ARTICLE_CONTENT_CHARS = 2400  # Max characters per article content
-    # Dynamic budget: calculated after collecting entries (entries * 30000)
+    # No article count limit - dynamic budget handles large article sets
 
     # Resolve task if specified
     task_row: sqlite3.Row | None = None
@@ -1223,9 +1222,8 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                     task_timezone = str(task_row["timezone"])
 
                 # Prepare articles for briefing generator
-                # Limit to prevent token overflow, sorted by recency (already done in _collect_entries)
-                limited_entries = entries[:MAX_LLM_ARTICLES]
-                articles = _prepare_articles_for_briefing(limited_entries)
+                # Articles are already sorted by recency in _collect_entries
+                articles = _prepare_articles_for_briefing(entries)
 
                 # Dynamic budget: entries * 30000 chars per entry
                 prompt_char_budget = len(entries) * 30000
