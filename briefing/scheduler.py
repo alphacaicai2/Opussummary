@@ -169,6 +169,57 @@ def _fetch_default_webhook_from_db() -> dict[str, Any] | None:
         return None
 
 
+def _fetch_custom_template_from_db(template_id: str) -> dict[str, Any] | None:
+    """
+    Fetch a custom/modified template from the 'custom_templates' table.
+
+    The custom_templates table stores user-modified versions of built-in templates
+    or entirely custom templates. When a user modifies a built-in template through
+    the web UI, it's saved here with the same ID as the built-in template.
+
+    Args:
+        template_id: The template identifier (e.g., "general", "investment")
+
+    Returns:
+        Dictionary with template data if found, None otherwise.
+        Contains: id, name, description, system_prompt, user_prompt_template,
+                  required_sections (as list), is_builtin
+    """
+    try:
+        with _get_db_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT id, name, description, system_prompt, user_prompt_template,
+                       required_sections, is_builtin
+                FROM custom_templates
+                WHERE id = ?
+                """,
+                (template_id,),
+            ).fetchone()
+            if row is None:
+                return None
+
+            # Parse required_sections JSON
+            required_sections = []
+            try:
+                required_sections = json.loads(row["required_sections"] or "[]")
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+            return {
+                "id": row["id"],
+                "name": row["name"],
+                "description": row["description"],
+                "system_prompt": row["system_prompt"],
+                "user_prompt_template": row["user_prompt_template"],
+                "required_sections": required_sections,
+                "is_builtin": bool(row["is_builtin"]),
+            }
+    except Exception as e:
+        logger.error("Failed to fetch custom template '%s' from database: %s", template_id, e)
+        return None
+
+
 def _resolve_llm_config_for_task(llm_config_id: int | None) -> dict[str, Any] | None:
     """
     Resolve LLM configuration from database for a task.
@@ -928,6 +979,21 @@ class BriefingScheduler:
             except ValueError:
                 resolved_template = BriefingTemplate.GENERAL
 
+            # Check for custom template in database
+            custom_template = _fetch_custom_template_from_db(template.lower())
+            custom_kwargs = {}
+            if custom_template:
+                logger.info(
+                    "Task %s: using custom template '%s' from database",
+                    task.id,
+                    template.lower(),
+                )
+                custom_kwargs = {
+                    "custom_system_prompt": custom_template.get("system_prompt"),
+                    "custom_user_prompt_template": custom_template.get("user_prompt_template"),
+                    "custom_required_sections": tuple(custom_template.get("required_sections", [])),
+                }
+
             request = BriefingGenerateRequest(
                 template=resolved_template,
                 articles=articles,
@@ -935,6 +1001,7 @@ class BriefingScheduler:
                 time_range_hours=time_range_hours,
                 output_format="markdown",
                 prompt_char_budget=prompt_char_budget,
+                **custom_kwargs,
             )
 
             result = generator.generate(request)

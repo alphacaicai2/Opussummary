@@ -197,6 +197,9 @@ class BriefingGenerateRequest:
         max_tokens: LLM max tokens override
         article_content_max_length: Max characters per article content (default: 2500)
         prompt_char_budget: Maximum total characters for all articles in prompt (default: 40000)
+        custom_system_prompt: Override system prompt (for custom/modified templates)
+        custom_user_prompt_template: Override user prompt template (for custom/modified templates)
+        custom_required_sections: Override required sections (for custom/modified templates)
     """
     template: BriefingTemplate | str
     articles: list[dict[str, Any]]
@@ -211,6 +214,10 @@ class BriefingGenerateRequest:
     max_tokens: int | None = None
     article_content_max_length: int = 2500
     prompt_char_budget: int = 40000
+    # Custom template overrides (for database-stored customizations)
+    custom_system_prompt: str | None = None
+    custom_user_prompt_template: str | None = None
+    custom_required_sections: tuple[str, ...] | None = None
 
 
 @dataclass(slots=True)
@@ -503,8 +510,27 @@ class BriefingGenerator:
             ArticleValidationError: If article validation fails
             OutputFormatError: If output format is invalid
         """
-        # Get and validate template
-        template = get_prompt_template(request.template)
+        # Get base template and apply custom overrides if provided
+        base_template = get_prompt_template(request.template)
+
+        # Check if custom prompts are provided (from database customizations)
+        if request.custom_system_prompt is not None or request.custom_user_prompt_template is not None:
+            # Create a custom PromptTemplate with overrides
+            template = PromptTemplate(
+                template_id=base_template.template_id,
+                name=base_template.name,
+                description=base_template.description,
+                system_prompt=request.custom_system_prompt or base_template.system_prompt,
+                user_prompt_template=request.custom_user_prompt_template or base_template.user_prompt_template,
+                required_sections=request.custom_required_sections if request.custom_required_sections is not None else base_template.required_sections,
+            )
+            logger.info(
+                "Using custom template overrides for '%s'",
+                request.template,
+            )
+        else:
+            template = base_template
+
         output_format = self._parse_output_format(request.output_format)
 
         # Validate article_content_max_length
