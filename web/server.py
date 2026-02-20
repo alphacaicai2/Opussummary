@@ -827,6 +827,7 @@ def _collect_entries(
     now = datetime.now(timezone.utc)
     threshold = now - timedelta(hours=time_range_hours)
     results: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()  # Deduplication by URL
 
     for entry in entries:
         # Filter by category
@@ -842,9 +843,16 @@ def _collect_entries(
         if timestamp and timestamp < threshold:
             continue
 
+        # Deduplicate by URL
+        entry_url = (entry.get("url") or "").strip()
+        if entry_url and entry_url in seen_urls:
+            continue
+        if entry_url:
+            seen_urls.add(entry_url)
+
         results.append(entry)
 
-    logger.info(f"Collected {len(results)} entries matching filters")
+    logger.info(f"Collected {len(results)} entries matching filters (deduplicated)")
     return results
 
 
