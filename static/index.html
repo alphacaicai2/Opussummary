@@ -1,0 +1,918 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Opus Relay · 配置管理</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --bg-primary: #0d1117;
+            --bg-secondary: #161b22;
+            --bg-tertiary: #21262d;
+            --bg-hover: #30363d;
+            --border: #30363d;
+            --border-focus: #58a6ff;
+            --text-primary: #e6edf3;
+            --text-secondary: #8b949e;
+            --text-muted: #6e7681;
+            --accent: #58a6ff;
+            --accent-hover: #79c0ff;
+            --success: #3fb950;
+            --success-bg: rgba(63, 185, 80, 0.1);
+            --error: #f85149;
+            --error-bg: rgba(248, 81, 73, 0.1);
+            --warning: #d29922;
+            --gradient-start: #58a6ff;
+            --gradient-end: #bc8cff;
+            --radius: 8px;
+            --radius-lg: 12px;
+            --shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+            --transition: 0.2s ease;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+            min-height: 100vh;
+        }
+
+        /* 顶部导航 */
+        .navbar {
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border);
+            padding: 16px 0;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            backdrop-filter: blur(12px);
+        }
+
+        .navbar-inner {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 0 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 18px;
+            font-weight: 700;
+        }
+
+        .logo-icon {
+            width: 32px;
+            height: 32px;
+            background: linear-gradient(135deg, var(--gradient-start), var(--gradient-end));
+            border-radius: var(--radius);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 16px;
+        }
+
+        .version-badge {
+            font-size: 11px;
+            padding: 2px 8px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            color: var(--text-secondary);
+            font-weight: 500;
+        }
+
+        /* 主体 */
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+
+        /* 卡片 */
+        .card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            margin-bottom: 20px;
+            overflow: hidden;
+            transition: border-color var(--transition);
+        }
+
+        .card:hover { border-color: var(--bg-hover); }
+
+        .card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border);
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .card-header:hover { background: var(--bg-tertiary); }
+
+        .card-title {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 15px;
+            font-weight: 600;
+        }
+
+        .card-title .icon { font-size: 18px; }
+
+        .card-toggle {
+            color: var(--text-muted);
+            transition: transform var(--transition);
+            font-size: 12px;
+        }
+
+        .card.collapsed .card-toggle { transform: rotate(-90deg); }
+        .card.collapsed .card-body { display: none; }
+
+        .card-body { padding: 20px; }
+
+        /* 表单 */
+        .form-group { margin-bottom: 16px; }
+        .form-group:last-child { margin-bottom: 0; }
+
+        .form-label {
+            display: block;
+            font-size: 13px;
+            font-weight: 500;
+            color: var(--text-secondary);
+            margin-bottom: 6px;
+        }
+
+        .form-row {
+            display: flex;
+            gap: 12px;
+            align-items: flex-end;
+        }
+
+        .form-row .form-group { flex: 1; }
+
+        input[type="text"],
+        input[type="password"],
+        input[type="number"],
+        select {
+            width: 100%;
+            padding: 10px 14px;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 14px;
+            transition: border-color var(--transition), box-shadow var(--transition);
+            outline: none;
+        }
+
+        input:focus, select:focus {
+            border-color: var(--border-focus);
+            box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.15);
+        }
+
+        input::placeholder { color: var(--text-muted); }
+
+        /* 按钮 */
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 10px 18px;
+            border: none;
+            border-radius: var(--radius);
+            font-family: inherit;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all var(--transition);
+            white-space: nowrap;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--gradient-start), var(--gradient-end));
+            color: #fff;
+        }
+
+        .btn-primary:hover { opacity: 0.9; transform: translateY(-1px); box-shadow: var(--shadow); }
+        .btn-primary:active { transform: translateY(0); }
+
+        .btn-secondary {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+        }
+
+        .btn-secondary:hover { background: var(--bg-hover); border-color: var(--text-muted); }
+
+        .btn-sm { padding: 7px 14px; font-size: 12px; }
+
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none !important; }
+
+        .btn .spinner {
+            width: 14px;
+            height: 14px;
+            border: 2px solid transparent;
+            border-top-color: currentColor;
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+        }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* 状态提示 */
+        .toast {
+            position: fixed;
+            top: 80px;
+            right: 24px;
+            padding: 14px 20px;
+            border-radius: var(--radius);
+            font-size: 13px;
+            font-weight: 500;
+            z-index: 1000;
+            animation: slideIn 0.3s ease;
+            max-width: 400px;
+            box-shadow: var(--shadow);
+        }
+
+        .toast.success { background: var(--success-bg); color: var(--success); border: 1px solid var(--success); }
+        .toast.error { background: var(--error-bg); color: var(--error); border: 1px solid var(--error); }
+
+        @keyframes slideIn { from { transform: translateX(100px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+        /* 路由表格 */
+        .route-table { width: 100%; border-collapse: collapse; }
+
+        .route-table th {
+            text-align: left;
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            padding: 8px 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .route-row {
+            border-bottom: 1px solid var(--border);
+        }
+
+        .route-row:last-child { border-bottom: none; }
+
+        .route-row td { padding: 10px 0; vertical-align: middle; }
+
+        .route-cat {
+            font-size: 13px;
+            font-weight: 500;
+            min-width: 140px;
+            padding-right: 12px;
+        }
+
+        .route-cat-id {
+            font-size: 11px;
+            color: var(--text-muted);
+            font-weight: 400;
+        }
+
+        .route-cat-feeds {
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+
+        .route-input-wrap {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex: 1;
+        }
+
+        .route-input-wrap input { font-size: 13px; padding: 8px 12px; }
+
+        /* 底部操作栏 */
+        .action-bar {
+            position: sticky;
+            bottom: 0;
+            background: var(--bg-secondary);
+            border-top: 1px solid var(--border);
+            padding: 16px 0;
+            backdrop-filter: blur(12px);
+        }
+
+        .action-bar-inner {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 0 24px;
+            display: flex;
+            justify-content: flex-end;
+            gap: 12px;
+        }
+
+        /* 测试结果 */
+        .test-result {
+            margin-top: 12px;
+            padding: 12px 16px;
+            border-radius: var(--radius);
+            font-size: 13px;
+            display: none;
+        }
+
+        .test-result.show { display: block; }
+        .test-result.success { background: var(--success-bg); color: var(--success); border: 1px solid rgba(63, 185, 80, 0.2); }
+        .test-result.error { background: var(--error-bg); color: var(--error); border: 1px solid rgba(248, 81, 73, 0.2); }
+
+        /* 加载状态 */
+        .loading-overlay {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 60px;
+            color: var(--text-muted);
+            gap: 12px;
+        }
+
+        .loading-overlay .spinner {
+            width: 20px;
+            height: 20px;
+            border: 2px solid var(--border);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
+        /* 日志面板 */
+        .log-panel {
+            background: #0a0e14;
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            height: 300px;
+            overflow-y: auto;
+            font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+            font-size: 12px;
+            line-height: 1.7;
+            padding: 12px 16px;
+        }
+
+        .log-panel::-webkit-scrollbar { width: 6px; }
+        .log-panel::-webkit-scrollbar-track { background: transparent; }
+        .log-panel::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+        .log-line { white-space: pre-wrap; word-break: break-all; }
+        .log-time { color: var(--text-muted); }
+        .log-name { color: var(--accent); }
+        .log-msg { color: var(--text-secondary); }
+        .log-level-INFO .log-msg { color: var(--text-primary); }
+        .log-level-WARNING .log-msg { color: var(--warning); }
+        .log-level-ERROR .log-msg { color: var(--error); }
+
+        .log-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 8px;
+        }
+
+        .ws-status {
+            font-size: 12px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .ws-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--error);
+        }
+
+        .ws-dot.connected { background: var(--success); }
+    </style>
+</head>
+<body>
+    <!-- 导航栏 -->
+    <nav class="navbar">
+        <div class="navbar-inner">
+            <div class="logo">
+                <div class="logo-icon">📡</div>
+                <span>Opus Relay</span>
+            </div>
+            <span class="version-badge">v1.0 · 配置管理</span>
+        </div>
+    </nav>
+
+    <!-- 主内容 -->
+    <div class="container" id="app">
+        <div class="loading-overlay" id="loading">
+            <div class="spinner"></div>
+            <span>加载配置中...</span>
+        </div>
+
+        <div id="content" style="display:none">
+            <!-- Miniflux 配置 -->
+            <div class="card" id="card-miniflux">
+                <div class="card-header" onclick="toggleCard('card-miniflux')">
+                    <div class="card-title"><span class="icon">📰</span> Miniflux 连接</div>
+                    <span class="card-toggle">▼</span>
+                </div>
+                <div class="card-body">
+                    <div class="form-group">
+                        <label class="form-label">API 端点</label>
+                        <input type="text" id="miniflux_url" placeholder="https://miniflux.example.com">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">API Token</label>
+                        <input type="password" id="miniflux_token" placeholder="输入 Miniflux API Token">
+                    </div>
+                    <button class="btn btn-secondary btn-sm" onclick="testMiniflux()">
+                        <span id="miniflux-btn-text">🔗 测试连接</span>
+                    </button>
+                    <div class="test-result" id="miniflux-result"></div>
+                </div>
+            </div>
+
+            <!-- 翻译 API 配置 -->
+            <div class="card" id="card-translation">
+                <div class="card-header" onclick="toggleCard('card-translation')">
+                    <div class="card-title"><span class="icon">🌐</span> 翻译 API</div>
+                    <span class="card-toggle">▼</span>
+                </div>
+                <div class="card-body">
+                    <div class="form-group">
+                        <label class="form-label">Base URL</label>
+                        <input type="text" id="translation_base_url" placeholder="https://api.siliconflow.cn/v1">
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label class="form-label">API Key</label>
+                            <input type="password" id="translation_api_key" placeholder="sk-...">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">模型</label>
+                            <input type="text" id="translation_model" placeholder="gpt-4o-mini">
+                        </div>
+                    </div>
+                    <button class="btn btn-secondary btn-sm" onclick="testTranslation()">
+                        <span id="translation-btn-text">🔗 测试翻译</span>
+                    </button>
+                    <div class="test-result" id="translation-result"></div>
+                </div>
+            </div>
+
+            <!-- 服务参数 -->
+            <div class="card" id="card-params">
+                <div class="card-header" onclick="toggleCard('card-params')">
+                    <div class="card-title"><span class="icon">⚙️</span> 服务参数</div>
+                    <span class="card-toggle">▼</span>
+                </div>
+                <div class="card-body">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label class="form-label">轮询间隔（分钟）</label>
+                            <input type="number" id="poll_interval" min="1" max="60" value="5">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">批量间隔（秒）</label>
+                            <input type="number" id="batch_interval" min="30" max="600" value="120">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">批量上限（条）</label>
+                            <input type="number" id="batch_max" min="1" max="50" value="15">
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">时区（显示文章发布时间）</label>
+                        <select id="timezone">
+                            <option value="UTC">UTC (协调世界时)</option>
+                            <option value="Asia/Shanghai">Asia/Shanghai (中国标准时间)</option>
+                            <option value="Asia/Tokyo">Asia/Tokyo (日本标准时间)</option>
+                            <option value="Asia/Seoul">Asia/Seoul (韩国标准时间)</option>
+                            <option value="Asia/Singapore">Asia/Singapore (新加坡时间)</option>
+                            <option value="Asia/Hong_Kong">Asia/Hong_Kong (香港时间)</option>
+                            <option value="Asia/Taipei">Asia/Taipei (台北时间)</option>
+                            <option value="America/New_York">America/New_York (美国东部时间)</option>
+                            <option value="America/Chicago">America/Chicago (美国中部时间)</option>
+                            <option value="America/Denver">America/Denver (美国山地时间)</option>
+                            <option value="America/Los_Angeles">America/Los_Angeles (美国太平洋时间)</option>
+                            <option value="Europe/London">Europe/London (伦敦时间)</option>
+                            <option value="Europe/Paris">Europe/Paris (巴黎时间)</option>
+                            <option value="Europe/Berlin">Europe/Berlin (柏林时间)</option>
+                            <option value="Australia/Sydney">Australia/Sydney (悉尼时间)</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">正文摘要长度（字符数）</label>
+                        <input type="number" id="content_summary_length" min="100" max="2000" value="300" style="max-width: 150px;">
+                        <span style="font-size: 12px; color: var(--text-muted); margin-left: 8px;">勾选「获取正文」的文章将截取此长度</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Discord 路由 -->
+            <div class="card" id="card-routes">
+                <div class="card-header" onclick="toggleCard('card-routes')">
+                    <div class="card-title"><span class="icon">🎯</span> Discord 路由</div>
+                    <span class="card-toggle">▼</span>
+                </div>
+                <div class="card-body">
+                    <div style="margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center;">
+                        <span style="font-size: 13px; color: var(--text-secondary);">按分组配置 Discord Webhook，每个分组推送到对应频道</span>
+                        <button class="btn btn-secondary btn-sm" onclick="loadFeeds()">
+                            <span id="feeds-btn-text">🔄 加载分组</span>
+                        </button>
+                    </div>
+                    <div id="routes-container">
+                        <p style="color: var(--text-muted); font-size: 13px; text-align: center; padding: 20px;">
+                            点击"加载分组"从 Miniflux 获取分组列表
+                        </p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 实时日志 -->
+            <div class="card" id="card-logs">
+                <div class="card-header" onclick="toggleCard('card-logs')">
+                    <div class="card-title"><span class="icon">📝</span> 实时日志</div>
+                    <span class="card-toggle">▼</span>
+                </div>
+                <div class="card-body">
+                    <div class="log-header">
+                        <div class="ws-status">
+                            <div class="ws-dot" id="ws-dot"></div>
+                            <span id="ws-status-text" style="color: var(--text-muted)">连接中...</span>
+                        </div>
+                        <button class="btn btn-secondary btn-sm" onclick="clearLogs()">🗑️ 清空</button>
+                    </div>
+                    <div class="log-panel" id="log-panel"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 底部保存栏 -->
+    <div class="action-bar" id="action-bar" style="display:none">
+        <div class="action-bar-inner">
+            <button class="btn btn-secondary" onclick="loadConfig()">↩️ 重新加载</button>
+            <button class="btn btn-primary" onclick="saveConfig()" id="save-btn">
+                <span id="save-btn-text">💾 保存配置</span>
+            </button>
+        </div>
+    </div>
+
+    <script>
+        // ========== 全局状态 ==========
+        let currentRoutes = {};
+        let categoriesData = [];
+
+        // ========== 工具函数 ==========
+        function showToast(msg, type = 'success') {
+            const existing = document.querySelector('.toast');
+            if (existing) existing.remove();
+
+            const toast = document.createElement('div');
+            toast.className = `toast ${type}`;
+            toast.textContent = msg;
+            document.body.appendChild(toast);
+            setTimeout(() => toast.remove(), 4000);
+        }
+
+        function showResult(id, msg, success) {
+            const el = document.getElementById(id);
+            el.textContent = msg;
+            el.className = `test-result show ${success ? 'success' : 'error'}`;
+        }
+
+        function toggleCard(id) {
+            document.getElementById(id).classList.toggle('collapsed');
+        }
+
+        function setLoading(btnId, loading) {
+            const el = document.getElementById(btnId);
+            if (loading) {
+                el.dataset.original = el.textContent;
+                el.innerHTML = '<div class="spinner"></div> 请稍候...';
+                el.closest('button').disabled = true;
+            } else {
+                el.textContent = el.dataset.original;
+                el.closest('button').disabled = false;
+            }
+        }
+
+        // ========== API 调用 ==========
+        async function api(method, path, body) {
+            const opts = { method, headers: { 'Content-Type': 'application/json' } };
+            if (body) opts.body = JSON.stringify(body);
+            const resp = await fetch(path, opts);
+            if (!resp.ok) {
+                const err = await resp.json().catch(() => ({ detail: '请求失败' }));
+                throw new Error(err.detail || '请求失败');
+            }
+            return resp.json();
+        }
+
+        // ========== 加载配置 ==========
+        async function loadConfig() {
+            try {
+                const config = await api('GET', '/api/config');
+
+                document.getElementById('miniflux_url').value = config.miniflux_url || '';
+                document.getElementById('miniflux_token').value = config.miniflux_token || '';
+
+                const t = config.translation || {};
+                document.getElementById('translation_base_url').value = t.base_url || '';
+                document.getElementById('translation_api_key').value = t.api_key || '';
+                document.getElementById('translation_model').value = t.model || 'gpt-4o-mini';
+
+                document.getElementById('poll_interval').value = config.poll_interval_minutes || 5;
+                document.getElementById('batch_interval').value = config.batch_interval_seconds || 120;
+                document.getElementById('batch_max').value = config.batch_max_items || 15;
+                document.getElementById('timezone').value = config.timezone || 'UTC';
+                document.getElementById('content_summary_length').value = config.content_summary_length || 300;
+
+                currentRoutes = config.routes || {};
+
+                document.getElementById('loading').style.display = 'none';
+                document.getElementById('content').style.display = 'block';
+                document.getElementById('action-bar').style.display = 'block';
+
+                // 如果有 Miniflux 配置，自动加载分组
+                if (config.miniflux_url && config.miniflux_token) {
+                    loadFeeds();
+                }
+            } catch (e) {
+                showToast('加载配置失败: ' + e.message, 'error');
+            }
+        }
+
+        // ========== 保存配置 ==========
+        async function saveConfig() {
+            setLoading('save-btn-text', true);
+            try {
+                // 从路由表格收集当前值
+                collectRoutes();
+
+                // 收集启用 Content 的分组
+                const categoriesWithContent = collectCategoriesWithContent();
+
+                const config = {
+                    miniflux_url: document.getElementById('miniflux_url').value.trim(),
+                    miniflux_token: document.getElementById('miniflux_token').value.trim(),
+                    poll_interval_minutes: parseInt(document.getElementById('poll_interval').value) || 5,
+                    batch_interval_seconds: parseInt(document.getElementById('batch_interval').value) || 120,
+                    batch_max_items: parseInt(document.getElementById('batch_max').value) || 15,
+                    timezone: document.getElementById('timezone').value,
+                    content_summary_length: parseInt(document.getElementById('content_summary_length').value) || 300,
+                    categories_with_content: categoriesWithContent,
+                    translation: {
+                        base_url: document.getElementById('translation_base_url').value.trim(),
+                        api_key: document.getElementById('translation_api_key').value.trim(),
+                        model: document.getElementById('translation_model').value.trim() || 'gpt-4o-mini',
+                    },
+                    routes: currentRoutes,
+                };
+
+                const result = await api('POST', '/api/config', config);
+                showToast(result.message || '✅ 配置已保存！', result.success ? 'success' : 'error');
+            } catch (e) {
+                showToast('保存失败: ' + e.message, 'error');
+            } finally {
+                setLoading('save-btn-text', false);
+            }
+        }
+
+        // ========== 测试 Miniflux ==========
+        async function testMiniflux() {
+            setLoading('miniflux-btn-text', true);
+            try {
+                const result = await api('POST', '/api/test/miniflux', {
+                    url: document.getElementById('miniflux_url').value.trim(),
+                    token: document.getElementById('miniflux_token').value.trim(),
+                });
+                showResult('miniflux-result', result.message, result.success);
+            } catch (e) {
+                showResult('miniflux-result', '测试失败: ' + e.message, false);
+            } finally {
+                setLoading('miniflux-btn-text', false);
+            }
+        }
+
+        // ========== 测试翻译 ==========
+        async function testTranslation() {
+            setLoading('translation-btn-text', true);
+            try {
+                const result = await api('POST', '/api/test/translation', {
+                    base_url: document.getElementById('translation_base_url').value.trim(),
+                    api_key: document.getElementById('translation_api_key').value.trim(),
+                    model: document.getElementById('translation_model').value.trim(),
+                });
+                const msg = result.success
+                    ? `${result.message}\n原文: ${result.original}\n译文: ${result.translated}`
+                    : result.message;
+                showResult('translation-result', msg, result.success);
+            } catch (e) {
+                showResult('translation-result', '测试失败: ' + e.message, false);
+            } finally {
+                setLoading('translation-btn-text', false);
+            }
+        }
+
+        // ========== 加载 Feed 分组 ==========
+        async function loadFeeds() {
+            setLoading('feeds-btn-text', true);
+            try {
+                const data = await api('GET', '/api/feeds');
+                categoriesData = data.categories;
+                renderRoutes(data.categories);
+            } catch (e) {
+                showToast('加载分组失败: ' + e.message, 'error');
+            } finally {
+                setLoading('feeds-btn-text', false);
+            }
+        }
+
+        function renderRoutes(categories) {
+            const container = document.getElementById('routes-container');
+
+            let html = `
+                <table class="route-table">
+                    <thead>
+                        <tr>
+                            <th style="width: 160px;">分组</th>
+                            <th style="width: 80px;">获取正文</th>
+                            <th>Webhook URL</th>
+                            <th style="width: 50px;">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+            `;
+
+            for (const cat of categories) {
+                const webhookUrl = currentRoutes[cat.id] || '';
+                const contentEnabled = cat.content_enabled || false;
+                html += `
+                    <tr class="route-row">
+                        <td class="route-cat">
+                            ${cat.name}
+                            <div class="route-cat-id">ID: ${cat.id} · ${cat.feeds.length} 个 Feed</div>
+                        </td>
+                        <td style="text-align: center;">
+                            <input type="checkbox"
+                                id="content-${cat.id}"
+                                ${contentEnabled ? 'checked' : ''}
+                                onchange="toggleContent('${cat.id}', this.checked)"
+                                style="width: 18px; height: 18px; cursor: pointer;">
+                        </td>
+                        <td>
+                            <div class="route-input-wrap">
+                                <input type="text"
+                                    id="route-${cat.id}"
+                                    value="${webhookUrl}"
+                                    placeholder="https://discord.com/api/webhooks/..."
+                                    data-cat-id="${cat.id}">
+                            </div>
+                        </td>
+                        <td>
+                            <button class="btn btn-secondary btn-sm" onclick="testWebhook('${cat.id}')" title="测试">
+                                🔔
+                            </button>
+                        </td>
+                    </tr>
+                `;
+            }
+
+            html += '</tbody></table>';
+            container.innerHTML = html;
+        }
+
+        // ========== 收集路由 ==========
+        function collectRoutes() {
+            currentRoutes = {};
+            const inputs = document.querySelectorAll('[data-cat-id]');
+            inputs.forEach(input => {
+                const val = input.value.trim();
+                if (val) {
+                    currentRoutes[input.dataset.catId] = val;
+                }
+            });
+        }
+
+        // ========== 收集启用 Content 的分组 ==========
+        function collectCategoriesWithContent() {
+            const enabled = [];
+            const checkboxes = document.querySelectorAll('input[type="checkbox"][id^="content-"]');
+            checkboxes.forEach(cb => {
+                if (cb.checked) {
+                    const catId = cb.id.replace('content-', '');
+                    enabled.push(catId);
+                }
+            });
+            return enabled;
+        }
+
+        // ========== 测试 Webhook ==========
+        async function testWebhook(catId) {
+            const input = document.getElementById(`route-${catId}`);
+            const url = input.value.trim();
+            if (!url) {
+                showToast('请先输入 Webhook URL', 'error');
+                return;
+            }
+
+            try {
+                const result = await api('POST', '/api/test/webhook', { webhook_url: url });
+                showToast(result.message, result.success ? 'success' : 'error');
+            } catch (e) {
+                showToast('测试失败: ' + e.message, 'error');
+            }
+        }
+
+        // ========== 切换分组 Content 配置 ==========
+        async function toggleContent(catId, enabled) {
+            try {
+                const result = await api('PUT', `/api/categories/${catId}/content`, { enabled });
+                if (result.success) {
+                    showToast(enabled ? '已启用正文获取' : '已关闭正文获取', 'success');
+                }
+            } catch (e) {
+                // 恢复勾选状态
+                document.getElementById(`content-${catId}`).checked = !enabled;
+                showToast('设置失败: ' + e.message, 'error');
+            }
+        }
+
+        // ========== WebSocket 实时日志 ==========
+        let ws = null;
+        let wsRetryTimer = null;
+
+        function connectWebSocket() {
+            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${location.host}/ws/logs`);
+
+            ws.onopen = () => {
+                document.getElementById('ws-dot').classList.add('connected');
+                document.getElementById('ws-status-text').textContent = '已连接';
+                document.getElementById('ws-status-text').style.color = 'var(--success)';
+            };
+
+            ws.onmessage = (event) => {
+                const log = JSON.parse(event.data);
+                appendLog(log);
+            };
+
+            ws.onclose = () => {
+                document.getElementById('ws-dot').classList.remove('connected');
+                document.getElementById('ws-status-text').textContent = '已断开，重连中...';
+                document.getElementById('ws-status-text').style.color = 'var(--error)';
+                // 自动重连
+                wsRetryTimer = setTimeout(connectWebSocket, 3000);
+            };
+
+            ws.onerror = () => ws.close();
+        }
+
+        function appendLog(log) {
+            const panel = document.getElementById('log-panel');
+            const line = document.createElement('div');
+            line.className = `log-line log-level-${log.level}`;
+            line.innerHTML = `<span class="log-time">${log.timestamp}</span> <span class="log-name">[${log.name}]</span> <span class="log-msg">${escapeHtml(log.message)}</span>`;
+            panel.appendChild(line);
+
+            // 保持最多 500 行
+            while (panel.children.length > 500) {
+                panel.removeChild(panel.firstChild);
+            }
+
+            // 自动滚动到底部
+            panel.scrollTop = panel.scrollHeight;
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function clearLogs() {
+            document.getElementById('log-panel').innerHTML = '';
+        }
+
+        // ========== 初始化 ==========
+        document.addEventListener('DOMContentLoaded', () => {
+            loadConfig();
+            connectWebSocket();
+        });
+    </script>
+</body>
+</html>

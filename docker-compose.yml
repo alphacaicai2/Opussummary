@@ -1,0 +1,10 @@
+services:
+  opus-relay:
+    build: .
+    container_name: opus-relay
+    restart: always
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./data:/app/data
+    environment:
+      - TZ=Asia/Shanghai
