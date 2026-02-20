@@ -12,10 +12,11 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import os
 import re
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import RLock
 from typing import TYPE_CHECKING, Any, Callable, Protocol, runtime_checkable
@@ -249,6 +250,146 @@ def _resolve_llm_config_for_task(llm_config_id: int | None) -> dict[str, Any] | 
     except Exception as e:
         logger.error("Failed to resolve LLM config: %s", e)
         return None
+
+
+def _resolve_miniflux_config() -> tuple[str, str]:
+    """
+    Resolve Miniflux connection configuration from database or environment.
+
+    Returns:
+        Tuple of (url, token)
+
+    Raises:
+        TaskExecutionError: If configuration is missing
+    """
+    # Try database settings first
+    try:
+        with _get_db_connection() as conn:
+            row = conn.execute(
+                "SELECT key, value FROM settings WHERE key IN ('miniflux_url', 'miniflux_token')"
+            ).fetchall()
+            settings = {r["key"]: r["value"] for r in row}
+            url = settings.get("miniflux_url", "")
+            token = settings.get("miniflux_token", "")
+    except Exception as e:
+        logger.warning("Failed to read Miniflux settings from database: %s", e)
+        url = ""
+        token = ""
+
+    # Fall back to environment variables
+    if not url:
+        url = os.getenv("MINIFLUX_URL", "").strip()
+    if not token:
+        token = os.getenv("MINIFLUX_TOKEN", "").strip()
+
+    if not url or not token:
+        raise TaskExecutionError(
+            "Miniflux configuration missing. Please set MINIFLUX_URL and MINIFLUX_TOKEN."
+        )
+
+    return url, token
+
+
+def _collect_entries_from_miniflux(
+    url: str,
+    token: str,
+    category_ids: list[int],
+    time_range_hours: int,
+) -> list[dict[str, Any]]:
+    """
+    Collect entries from Miniflux based on filters.
+
+    Args:
+        url: Miniflux base URL
+        token: Miniflux API token
+        category_ids: List of category IDs to filter (empty = all)
+        time_range_hours: Hours to look back
+
+    Returns:
+        List of entries matching the filters
+    """
+    from api.miniflux_client import MinifluxClient
+
+    client = MinifluxClient(base_url=url, api_token=token)
+    try:
+        entries = client.get_unread_entries(limit=500)
+    finally:
+        client.close()
+
+    now = datetime.now(timezone.utc)
+    threshold = now - timedelta(hours=time_range_hours)
+    results: list[dict[str, Any]] = []
+
+    for entry in entries:
+        # Filter by category
+        category = ((entry.get("feed") or {}).get("category") or {})
+        category_id = category.get("id")
+        if category_ids and category_id not in category_ids:
+            continue
+
+        # Filter by time
+        published_at_str = entry.get("published_at") or entry.get("changed_at")
+        if published_at_str:
+            try:
+                # Parse ISO format timestamp
+                timestamp_str = published_at_str.replace("Z", "+00:00")
+                timestamp = datetime.fromisoformat(timestamp_str)
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=timezone.utc)
+                if timestamp < threshold:
+                    continue
+            except (ValueError, TypeError):
+                pass  # Include entry if we can't parse the timestamp
+
+        results.append(entry)
+
+    logger.info("Collected %d entries from Miniflux", len(results))
+    return results
+
+
+def _prepare_articles_for_briefing(entries: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """
+    Convert Miniflux entries to BriefingGenerator-compatible article format.
+
+    Args:
+        entries: Raw entries from Miniflux
+
+    Returns:
+        List of normalized article dictionaries
+    """
+    articles: list[dict[str, str]] = []
+
+    for entry in entries:
+        feed = entry.get("feed") or {}
+        category = feed.get("category") or {}
+
+        # Content priority: content > summary > description
+        content = (
+            entry.get("content")
+            or entry.get("summary")
+            or entry.get("description")
+            or ""
+        )
+
+        article = {
+            "title": str(entry.get("title") or "无标题").strip(),
+            "url": str(entry.get("url") or "").strip(),
+            "published_at": str(
+                entry.get("published_at")
+                or entry.get("changed_at")
+                or ""
+            ).strip(),
+            "source": str(feed.get("title") or "Unknown Feed").strip(),
+            "content": str(content).strip(),
+            "category": str(
+                category.get("title")
+                or category.get("id")
+                or ""
+            ).strip(),
+        }
+        articles.append(article)
+
+    return articles
 
 
 # =============================================================================
@@ -711,8 +852,13 @@ class BriefingScheduler:
         """
         Generate briefing content for a task.
 
+        This method:
+        1. Fetches articles from Miniflux based on task's categories and time range
+        2. Creates a BriefingGenerateRequest with the articles
+        3. Calls the BriefingGenerator to generate content
+
         Args:
-            task: The briefing task configuration.
+            task: The briefing task configuration (WebTask).
 
         Returns:
             The generated briefing content as a string.
@@ -720,26 +866,83 @@ class BriefingScheduler:
         Raises:
             TaskExecutionError: If briefing generation fails.
         """
+        # Get task parameters
+        category_ids = task.categories or []
+        time_range_hours = task.time_range_hours or 24
+        template = task.template or "general"
+        timezone_name = task.timezone or "Asia/Shanghai"
+
+        # Step 1: Get Miniflux configuration
+        try:
+            miniflux_url, miniflux_token = _resolve_miniflux_config()
+        except TaskExecutionError:
+            raise
+        except Exception as e:
+            raise TaskExecutionError(f"Failed to resolve Miniflux config: {e}") from e
+
+        # Step 2: Fetch entries from Miniflux
+        try:
+            entries = _collect_entries_from_miniflux(
+                url=miniflux_url,
+                token=miniflux_token,
+                category_ids=category_ids,
+                time_range_hours=time_range_hours,
+            )
+        except Exception as e:
+            raise TaskExecutionError(f"Failed to fetch entries from Miniflux: {e}") from e
+
+        logger.info(
+            "Task %s: fetched %d entries from Miniflux (categories=%s, hours=%d)",
+            task.id,
+            len(entries),
+            category_ids if category_ids else "all",
+            time_range_hours,
+        )
+
+        # Step 3: Prepare articles for briefing
+        articles = _prepare_articles_for_briefing(entries)
+
+        if not articles:
+            logger.info("Task %s: no articles to process, returning empty content", task.id)
+            return "# OpusBrief\n\n暂无符合条件的文章。\n"
+
+        # Step 4: Create generator with LLM client
         generator = self._get_generator(task)
 
-        # Try different method names for compatibility
-        method_names = ["generate_for_task", "generate_briefing", "generate"]
+        # Step 5: Create BriefingGenerateRequest and generate
+        try:
+            from briefing.generator import BriefingGenerateRequest, BriefingTemplate
 
-        for method_name in method_names:
-            method = getattr(generator, method_name, None)
-            if callable(method):
-                try:
-                    result = self._call_generator_method(method, task)
-                    return self._extract_content(result)
-                except Exception as e:
-                    logger.warning(
-                        "Generator method '%s' failed: %s",
-                        method_name,
-                        e,
-                    )
-                    continue
+            # Normalize template
+            try:
+                resolved_template = BriefingTemplate(template.lower())
+            except ValueError:
+                resolved_template = BriefingTemplate.GENERAL
 
-        raise TaskExecutionError("No compatible generator method found")
+            request = BriefingGenerateRequest(
+                template=resolved_template,
+                articles=articles,
+                timezone=timezone_name,
+                time_range_hours=time_range_hours,
+                output_format="markdown",
+            )
+
+            result = generator.generate(request)
+
+            if result and result.markdown:
+                logger.info(
+                    "Task %s: generated briefing successfully (%d chars)",
+                    task.id,
+                    len(result.markdown),
+                )
+                return result.markdown
+            else:
+                raise TaskExecutionError("Generator returned empty content")
+
+        except TaskExecutionError:
+            raise
+        except Exception as e:
+            raise TaskExecutionError(f"Briefing generation failed: {e}") from e
 
     def _get_generator(self, task: Any) -> Any:
         """
