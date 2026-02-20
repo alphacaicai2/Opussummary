@@ -1127,7 +1127,7 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
     # Token limit constants (prevent LLM context overflow)
     MAX_LLM_ARTICLES = 25  # Reduced from 50 to prevent token overflow
     MAX_ARTICLE_CONTENT_CHARS = 2400  # Max characters per article content
-    MAX_TOTAL_ARTICLE_CHARS = 40000  # Max total characters for all articles combined
+    # Dynamic budget: calculated after collecting entries (entries * 30000)
 
     # Resolve task if specified
     task_row: sqlite3.Row | None = None
@@ -1213,6 +1213,14 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                 limited_entries = entries[:MAX_LLM_ARTICLES]
                 articles = _prepare_articles_for_briefing(limited_entries)
 
+                # Dynamic budget: entries * 30000 chars per entry
+                prompt_char_budget = len(entries) * 30000
+                logger.info(
+                    "Dynamic prompt_char_budget = %d entries * 30000 = %d chars",
+                    len(entries),
+                    prompt_char_budget,
+                )
+
                 # Truncate article content to prevent token overflow
                 total_chars = 0
                 truncated_articles: list[dict[str, str]] = []
@@ -1229,9 +1237,9 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                         article = {**article, "content": content}
 
                     # Check if adding this article would exceed total budget
-                    if total_chars + len(content) > MAX_TOTAL_ARTICLE_CHARS:
+                    if total_chars + len(content) > prompt_char_budget:
                         # Truncate content to fit remaining budget
-                        remaining = MAX_TOTAL_ARTICLE_CHARS - total_chars
+                        remaining = prompt_char_budget - total_chars
                         if remaining > 0:
                             if len(content) > remaining:
                                 keep = remaining - len(ellipsis)
@@ -1249,9 +1257,10 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
 
                 articles = truncated_articles
                 logger.info(
-                    "Prepared %d articles for LLM (total chars: %d)",
+                    "Prepared %d articles for LLM (total chars: %d, budget: %d)",
                     len(articles),
                     total_chars,
+                    prompt_char_budget,
                 )
 
                 # Create briefing generator and request
@@ -1280,6 +1289,7 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                     time_range_hours=time_range_hours,
                     output_format="markdown",
                     article_content_max_length=MAX_ARTICLE_CONTENT_CHARS,  # Pass limit to generator
+                    prompt_char_budget=prompt_char_budget,  # Dynamic budget
                     **custom_template_kwargs,
                 )
 
