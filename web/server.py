@@ -938,7 +938,7 @@ def _resolve_llm_config(
         if llm_config_id is not None:
             row = conn.execute(
                 """
-                SELECT id, provider, base_url, api_key, model
+                SELECT id, name, provider, base_url, api_key, model
                 FROM llm_configs
                 WHERE id = ?
                 """,
@@ -961,7 +961,7 @@ def _resolve_llm_config(
         # Try to get default config
         row = conn.execute(
             """
-            SELECT id, provider, base_url, api_key, model
+            SELECT id, name, provider, base_url, api_key, model
             FROM llm_configs
             WHERE is_default = 1
             ORDER BY id DESC
@@ -975,7 +975,7 @@ def _resolve_llm_config(
         # Fallback: get first available config
         return conn.execute(
             """
-            SELECT id, provider, base_url, api_key, model
+            SELECT id, name, provider, base_url, api_key, model
             FROM llm_configs
             ORDER BY id ASC
             LIMIT 1
@@ -1216,8 +1216,8 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                     "  Model: %s\n"
                     "  Base URL: %s\n"
                     "  API Style: %s",
-                    llm_row.get("id"),
-                    llm_row.get("name"),
+                    llm_row["id"],
+                    llm_row["name"] or "(unnamed)",
                     provider,
                     llm_row["model"],
                     llm_row["base_url"],
