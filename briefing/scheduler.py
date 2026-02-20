@@ -262,11 +262,11 @@ def _resolve_miniflux_config() -> tuple[str, str]:
     Raises:
         TaskExecutionError: If configuration is missing
     """
-    # Try database settings first
+    # Try database settings first (using system_settings table)
     try:
         with _get_db_connection() as conn:
             row = conn.execute(
-                "SELECT key, value FROM settings WHERE key IN ('miniflux_url', 'miniflux_token')"
+                "SELECT key, value FROM system_settings WHERE key IN ('miniflux_url', 'miniflux_token')"
             ).fetchall()
             settings = {r["key"]: r["value"] for r in row}
             url = settings.get("miniflux_url", "")
