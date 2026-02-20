@@ -1548,6 +1548,42 @@ def create_app() -> FastAPI:
             conn.commit()
         return {"ok": True, "id": config_id}
 
+    @app.put("/api/llm-configs/{config_id}", response_model=LLMConfigOut)
+    def update_llm_config(config_id: int, payload: LLMConfigCreate) -> LLMConfigOut:
+        """Update an existing LLM configuration."""
+        now = _utcnow_iso()
+        with _get_conn() as conn:
+            exists = conn.execute("SELECT 1 FROM llm_configs WHERE id = ?", (config_id,)).fetchone()
+            if not exists:
+                raise HTTPException(status_code=404, detail=f"LLM config not found: {config_id}")
+            
+            # 如果设置为默认，先清除其他默认标记
+            if payload.is_default:
+                conn.execute("UPDATE llm_configs SET is_default = 0 WHERE is_default = 1")
+
+            conn.execute(
+                """
+                UPDATE llm_configs
+                SET
+                    name = ?, provider = ?, base_url = ?, api_key = ?, model = ?,
+                    is_default = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    payload.name,
+                    payload.provider,
+                    payload.base_url,
+                    payload.api_key,
+                    payload.model,
+                    int(payload.is_default),
+                    now,
+                    config_id,
+                ),
+            )
+            conn.commit()
+            row = conn.execute("SELECT * FROM llm_configs WHERE id = ?", (config_id,)).fetchone()
+        return _llm_row_to_model(row)
+
     @app.put("/api/llm-configs/{config_id}/default")
     def set_default_llm_config(config_id: int) -> dict[str, Any]:
         """将指定 LLM 配置设为默认。"""
@@ -1612,6 +1648,39 @@ def create_app() -> FastAPI:
             conn.execute("DELETE FROM webhooks WHERE id = ?", (webhook_id,))
             conn.commit()
         return {"ok": True, "id": webhook_id}
+
+    @app.put("/api/webhooks/{webhook_id}", response_model=WebhookOut)
+    def update_webhook(webhook_id: int, payload: WebhookCreate) -> WebhookOut:
+        """Update an existing webhook."""
+        now = _utcnow_iso()
+        with _get_conn() as conn:
+            exists = conn.execute("SELECT 1 FROM webhooks WHERE id = ?", (webhook_id,)).fetchone()
+            if not exists:
+                raise HTTPException(status_code=404, detail=f"Webhook not found: {webhook_id}")
+            
+            # 如果设置为默认，先清除其他默认标记
+            if payload.is_default:
+                conn.execute("UPDATE webhooks SET is_default = 0 WHERE is_default = 1")
+
+            conn.execute(
+                """
+                UPDATE webhooks
+                SET name = ?, type = ?, url = ?, is_default = ?, enabled = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    payload.name,
+                    payload.type,
+                    payload.url,
+                    int(payload.is_default),
+                    int(payload.enabled),
+                    now,
+                    webhook_id,
+                ),
+            )
+            conn.commit()
+            row = conn.execute("SELECT * FROM webhooks WHERE id = ?", (webhook_id,)).fetchone()
+        return _webhook_row_to_model(row)
 
     # =========================================================================
     # Task API

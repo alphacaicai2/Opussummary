@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  opusbrief:
+    build: .
+    container_name: opusbrief
+    restart: unless-stopped
+    ports:
+      - "8812:8812"
+    volumes:
+      - ./data:/app/data
+      - ./.env:/app/.env
+    environment:
+      - TZ=Asia/Shanghai
+      - WEB_PORT=8812

@@ -271,7 +271,8 @@
     <!-- LLM Modal -->
     <div id="llm-modal" class="fixed inset-0 bg-black/50 hidden items-center justify-center z-50">
         <div class="bg-gray-800 rounded-xl p-6 w-full max-w-md mx-4 border border-gray-700">
-            <h3 class="text-lg font-semibold mb-4">添加 LLM 配置</h3>
+            <h3 class="text-lg font-semibold mb-4" id="llm-modal-title">添加 LLM 配置</h3>
+            <input type="hidden" id="llm-id" value="">
             <div class="space-y-4">
                 <div>
                     <label class="block text-sm text-gray-400 mb-1">配置名称</label>
@@ -325,7 +326,8 @@
     <!-- Webhook Modal -->
     <div id="webhook-modal" class="fixed inset-0 bg-black/50 hidden items-center justify-center z-50">
         <div class="bg-gray-800 rounded-xl p-6 w-full max-w-md mx-4 border border-gray-700">
-            <h3 class="text-lg font-semibold mb-4">添加 Webhook</h3>
+            <h3 class="text-lg font-semibold mb-4" id="webhook-modal-title">添加 Webhook</h3>
+            <input type="hidden" id="webhook-id" value="">
             <div class="space-y-4">
                 <div>
                     <label class="block text-sm text-gray-400 mb-1">名称</label>
@@ -675,22 +677,40 @@
         }
 
         // LLM Config Functions
-        function showLLMModal() {
+        function showLLMModal(config = null) {
             document.getElementById('llm-modal').classList.remove('hidden');
             document.getElementById('llm-modal').classList.add('flex');
-            fillProviderDefaults();
+            
+            if (config) {
+                document.getElementById('llm-modal-title').textContent = '编辑 LLM 配置';
+                document.getElementById('llm-id').value = config.id;
+                document.getElementById('llm-name').value = config.name;
+                document.getElementById('llm-provider').value = config.provider;
+                document.getElementById('llm-base-url').value = config.base_url;
+                document.getElementById('llm-api-key').value = '';
+                document.getElementById('llm-api-key').placeholder = config.api_key_masked + ' (留空则不修改)';
+                document.getElementById('llm-model').value = config.model;
+                document.getElementById('llm-default').checked = config.is_default;
+            } else {
+                document.getElementById('llm-modal-title').textContent = '添加 LLM 配置';
+                document.getElementById('llm-id').value = '';
+                document.getElementById('llm-api-key').placeholder = 'sk-xxx';
+                fillProviderDefaults();
+            }
         }
 
         function hideLLMModal() {
             document.getElementById('llm-modal').classList.add('hidden');
             document.getElementById('llm-modal').classList.remove('flex');
             // Clear form
+            document.getElementById('llm-id').value = '';
             document.getElementById('llm-name').value = '';
             document.getElementById('llm-api-key').value = '';
             document.getElementById('llm-default').checked = false;
         }
 
         function fillProviderDefaults() {
+            // ... (keep this intact since we just need to ensure the ID isn't clobbered)
             const provider = document.getElementById('llm-provider').value;
             const providers = {
                 openai: { base_url: 'https://api.openai.com/v1', model: 'gpt-4o' },
@@ -708,6 +728,7 @@
         }
 
         async function saveLLMConfig() {
+            const id = document.getElementById('llm-id').value;
             const name = document.getElementById('llm-name').value;
             const provider = document.getElementById('llm-provider').value;
             const base_url = document.getElementById('llm-base-url').value;
@@ -715,16 +736,32 @@
             const model = document.getElementById('llm-model').value;
             const is_default = document.getElementById('llm-default').checked;
 
-            if (!name || !api_key) {
-                showToast('请填写配置名称和 API Key', 'warning');
+            if (!name) {
+                showToast('请填写配置名称', 'warning');
+                return;
+            }
+            if (!id && !api_key) {
+                showToast('请填写 API Key', 'warning');
+                return;
+            }
+
+            const payload = { name, provider, base_url, model, is_default };
+            if (api_key) {
+                payload.api_key = api_key;
+            } else if (id) {
+                // 如果是编辑 && API 没填，找回原 API Key 会在后端做，但后端现有 PUT 接口限制，如果是通过前端，可以传占位或者暂时强制用户重填。
+                // 若不想改后端让 api_key 可选，最简单的做法：编辑时如果没填 API KEY，我们需要将原来的找回。
+                // 暂时方案：前端如果为空且 ID 存在，提示用户在当前小改动版本必须填一下，或者后端的 PUT 必须要 api_key 参数
+                showToast('编辑时请重新填入 API Key', 'warning');
                 return;
             }
 
             try {
-                await api('/api/llm-configs', {
-                    method: 'POST',
-                    body: { name, provider, base_url, api_key, model, is_default }
-                });
+                if (id) {
+                    await api(`/api/llm-configs/${id}`, { method: 'PUT', body: payload });
+                } else {
+                    await api('/api/llm-configs', { method: 'POST', body: payload });
+                }
                 showToast('LLM 配置已保存');
                 hideLLMModal();
                 loadLLMConfigs();
@@ -759,6 +796,7 @@
                     <div class="flex items-center space-x-2 ml-2 flex-shrink-0">
                         ${!config.is_default ? `<button onclick="setDefaultLLM(${config.id})" class="text-xs text-gray-400 hover:text-primary" title="设为默认配置">设为默认</button>` : ''}
                         <button onclick="testLLM(${config.id})" class="text-xs text-gray-400 hover:text-white">测试</button>
+                        <button onclick="showLLMModal(state.llmConfigs.find(c => c.id === ${config.id}))" class="text-xs text-blue-400 hover:text-blue-300">编辑</button>
                         <button onclick="deleteLLM(${config.id})" class="text-xs text-red-400 hover:text-red-300">删除</button>
                     </div>
                 </div>
@@ -812,36 +850,65 @@
         }
 
         // Webhook Functions
-        function showWebhookModal() {
+        function showWebhookModal(webhook = null) {
             document.getElementById('webhook-modal').classList.remove('hidden');
             document.getElementById('webhook-modal').classList.add('flex');
+            
+            if (webhook) {
+                document.getElementById('webhook-modal-title').textContent = '编辑 Webhook';
+                document.getElementById('webhook-id').value = webhook.id;
+                document.getElementById('webhook-name').value = webhook.name;
+                document.getElementById('webhook-type').value = webhook.type;
+                document.getElementById('webhook-url').value = '';
+                document.getElementById('webhook-url').placeholder = webhook.url_masked + ' (在此填入完整URL来重写)';
+                document.getElementById('webhook-default').checked = webhook.is_default;
+            } else {
+                document.getElementById('webhook-modal-title').textContent = '添加 Webhook';
+                document.getElementById('webhook-id').value = '';
+                document.getElementById('webhook-url').placeholder = 'https://discord.com/api/webhooks/...';
+            }
         }
 
         function hideWebhookModal() {
             document.getElementById('webhook-modal').classList.add('hidden');
             document.getElementById('webhook-modal').classList.remove('flex');
             // Clear form
+            document.getElementById('webhook-id').value = '';
             document.getElementById('webhook-name').value = '';
             document.getElementById('webhook-url').value = '';
             document.getElementById('webhook-default').checked = false;
         }
 
         async function saveWebhook() {
+            const id = document.getElementById('webhook-id').value;
             const name = document.getElementById('webhook-name').value;
             const type = document.getElementById('webhook-type').value;
             const url = document.getElementById('webhook-url').value;
             const is_default = document.getElementById('webhook-default').checked;
+            const enabled = true; // 暂无前端修改开关
 
-            if (!name || !url) {
-                showToast('请填写名称和 URL', 'warning');
+            if (!name) {
+                showToast('请填写名称', 'warning');
+                return;
+            }
+            if (!id && !url) {
+                showToast('请填写 URL', 'warning');
+                return;
+            }
+
+            const payload = { name, type, is_default, enabled, url: url || 'http://dummy.com' }; 
+            // 若为更新，URL也必须重填因为后端没有保存原本的完全可见URL
+            if (id && !url) {
+                showToast('编辑 Webhook 时必须重新填入完整的 URL', 'warning');
                 return;
             }
 
             try {
-                await api('/api/webhooks', {
-                    method: 'POST',
-                    body: { name, type, url, is_default }
-                });
+                if (id) {
+                    await api(`/api/webhooks/${id}`, { method: 'PUT', body: payload });
+                } else {
+                    await api('/api/webhooks', { method: 'POST', body: payload });
+                }
                 showToast('Webhook 已保存');
                 hideWebhookModal();
                 loadWebhooks();
@@ -875,6 +942,7 @@
                     </div>
                     <div class="flex items-center space-x-2">
                         <button onclick="testWebhook(${wh.id})" class="text-xs text-gray-400 hover:text-white">测试</button>
+                        <button onclick="showWebhookModal(state.webhooks.find(w => w.id === ${wh.id}))" class="text-xs text-blue-400 hover:text-blue-300">编辑</button>
                         <button onclick="deleteWebhook(${wh.id})" class="text-xs text-red-400 hover:text-red-300">删除</button>
                     </div>
                 </div>
@@ -1120,7 +1188,7 @@
                             ${task.last_run_at ? `<p class="text-xs text-gray-500 mt-1">上次运行: ${new Date(task.last_run_at).toLocaleString()}</p>` : ''}
                         </div>
                         <div class="flex items-center space-x-2">
-                            <button onclick="runTask(${task.id})" class="text-sm bg-primary/20 text-primary hover:bg-primary/30 rounded px-3 py-1 transition-colors">
+                            <button id="run-btn-${task.id}" onclick="runTask(${task.id})" class="text-sm bg-primary/20 text-primary hover:bg-primary/30 rounded px-3 py-1 transition-colors flex items-center justify-center min-w-[60px]">
                                 运行
                             </button>
                             <button onclick="showTaskModal(state.tasks.find(t => t.id === ${task.id}))" class="text-sm text-gray-400 hover:text-white">
@@ -1142,14 +1210,26 @@
         }
 
         async function runTask(id) {
+            const btn = document.getElementById(`run-btn-${id}`);
+            if (btn) {
+                btn.disabled = true;
+                btn.innerHTML = '<svg class="w-4 h-4 spinner text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>';
+            }
+
             try {
                 const result = await api('/api/generate', {
                     method: 'POST',
                     body: { task_id: id }
                 });
                 showToast(`生成完成，共 ${result.article_count} 篇文章`);
+                loadHistory(); // 自动刷新简报历史
             } catch (e) {
                 showToast('生成失败: ' + e.message, 'error');
+            } finally {
+                if (btn) {
+                    btn.disabled = false;
+                    btn.innerHTML = '运行';
+                }
             }
         }
 
@@ -1196,6 +1276,7 @@
                 });
                 showToast(`生成完成，共 ${result.article_count} 篇文章`);
                 showGenerateResult(result);
+                loadHistory(); // 自动刷新历史记录
             } catch (e) {
                 showToast('生成失败: ' + e.message, 'error');
             } finally {
@@ -1288,6 +1369,12 @@
                 case 'degraded': return { cls: 'bg-yellow-500/20 text-yellow-400', text: '降级' };
                 default: return { cls: 'bg-red-500/20 text-red-400', text: '失败' };
             }
+        }
+
+        // 获取模板名称
+        function getTemplateName(templateId) {
+            const tmpl = state.templates.find(t => t.id === templateId);
+            return tmpl ? escapeHtml(tmpl.name) : escapeHtml(templateId);
         }
 
         function renderHistory() {

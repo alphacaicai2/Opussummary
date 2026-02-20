@@ -101,8 +101,8 @@ For more information, visit: https://github.com/your-repo/opusbrief
     parser.add_argument(
         "--port",
         type=int,
-        default=int(os.getenv("WEB_PORT", "8090")),
-        help="Web server port (default: 8090)",
+        default=int(os.getenv("WEB_PORT", "8812")),
+        help="Web server port (default: 8812)",
     )
     parser.add_argument(
         "--reload",
