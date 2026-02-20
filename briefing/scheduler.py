@@ -407,8 +407,17 @@ class BriefingScheduler:
         if not task.enabled:
             raise ValueError(f"Task {task.id} is disabled and cannot be scheduled")
 
+        # Resolve the actual schedule expression:
+        # - If schedule is "cron" type, use cron_expr field
+        # - Otherwise, use schedule field directly (may be time like "09:00" or prefixed expression)
+        schedule_type = (task.schedule or "").strip().lower()
+        if schedule_type == "cron" and task.cron_expr:
+            schedule_expr = task.cron_expr
+        else:
+            schedule_expr = task.schedule or ""
+
         trigger = self._build_trigger(
-            schedule_expr=task.schedule or "",
+            schedule_expr=schedule_expr,
             tz_name=task.timezone or self._default_timezone,
         )
 
