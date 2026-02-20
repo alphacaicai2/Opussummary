@@ -1,5 +1,17 @@
 {
   "permissions": {
-    "mode": "bypassPermissions"
+    "mode": "bypassPermissions",
+    "allowedTools": [
+      "Task",
+      "Bash",
+      "Glob",
+      "Grep",
+      "Read",
+      "Edit",
+      "Write",
+      "WebFetch",
+      "WebSearch",
+      "NotebookEdit"
+    ]
   }
 }

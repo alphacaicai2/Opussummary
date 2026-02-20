@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__codex__codex",
+      "Bash(python:*)",
+      "Bash(.venvScriptspython.exe -m py_compile llm/__init__.py llm/providers.py llm/client.py)",
+      "Bash(\"c:\\\\Users\\\\TonyS\\\\Desktop\\\\OpusSummary\\\\.venv\\\\Scripts\\\\python.exe\" -m py_compile \"c:\\\\Users\\\\TonyS\\\\Desktop\\\\OpusSummary\\\\llm\\\\__init__.py\" \"c:\\\\Users\\\\TonyS\\\\Desktop\\\\OpusSummary\\\\llm\\\\providers.py\" \"c:\\\\Users\\\\TonyS\\\\Desktop\\\\OpusSummary\\\\llm\\\\client.py\")",
+      "Bash(\"c:\\\\Users\\\\TonyS\\\\Desktop\\\\OpusSummary\\\\.venv\\\\Scripts\\\\python.exe\" -c \"import sys; sys.path.insert\\(0, r''c:\\\\Users\\\\TonyS\\\\Desktop\\\\OpusSummary''\\); from llm import LLMClient, PROVIDERS, get_provider, resolve_base_url, LLMError; print\\(''Import test passed''\\); print\\(f''Providers: {list\\(PROVIDERS.keys\\(\\)\\)}''\\)\")",
+      "Bash(\"c:\\\\Users\\\\TonyS\\\\Desktop\\\\OpusSummary\\\\.venv\\\\Scripts\\\\python.exe\" -c \"import sys; sys.path.insert\\(0, r''c:\\\\Users\\\\TonyS\\\\Desktop\\\\OpusSummary''\\); from llm import LLMClient, PROVIDERS, get_provider, resolve_base_url, list_providers; print\\(''All imports successful''\\); print\\(f''Total providers: {len\\(PROVIDERS\\)}''\\); [print\\(f''  - {p.id}: {p.name}''\\) for p in list_providers\\(\\)]\")",
+      "Bash(.venv/Scripts/python.exe:*)",
+      "Bash(taskkill:*)",
+      "Bash(timeout:*)",
+      "Bash(tasklist:*)",
+      "Bash(netstat:*)"
+    ]
+  }
+}

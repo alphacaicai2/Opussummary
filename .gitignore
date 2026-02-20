@@ -2,3 +2,11 @@ config.json
 data/
 __pycache__/
 *.pyc
+.env
+*.db
+*.db-wal
+*.db-shm
+.venv/
+.idea/
+.vscode/
+*.log
