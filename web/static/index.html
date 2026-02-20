@@ -101,7 +101,7 @@
                             </div>
                             <div>
                                 <label class="block text-sm text-gray-400 mb-1">API Token</label>
-                                <input type="password" id="miniflux-token" placeholder="输入 API Token"
+                                <input type="password" id="miniflux-token" placeholder="输入 API Token" autocomplete="current-password"
                                     class="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-primary">
                             </div>
                             <button onclick="testMiniflux()" class="w-full bg-primary hover:bg-primary/80 text-white rounded-lg px-4 py-2 text-sm font-medium transition-colors">
@@ -301,13 +301,25 @@
                 </div>
                 <div>
                     <label class="block text-sm text-gray-400 mb-1">API Key</label>
-                    <input type="password" id="llm-api-key" placeholder="sk-xxx"
+                    <input type="password" id="llm-api-key" placeholder="sk-xxx" autocomplete="new-password"
                         class="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-primary">
                 </div>
                 <div>
                     <label class="block text-sm text-gray-400 mb-1">模型名称</label>
                     <input type="text" id="llm-model" placeholder="gpt-4o"
                         class="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-primary">
+                </div>
+                <div class="grid grid-cols-2 gap-3">
+                    <div>
+                        <label class="block text-sm text-gray-400 mb-1">Max Tokens <span class="text-gray-500">(可选)</span></label>
+                        <input type="number" id="llm-max-tokens" placeholder="4096" min="1" max="128000"
+                            class="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-primary">
+                    </div>
+                    <div>
+                        <label class="block text-sm text-gray-400 mb-1">Temperature <span class="text-gray-500">(可选)</span></label>
+                        <input type="number" id="llm-temperature" placeholder="0.2" min="0" max="2" step="0.1"
+                            class="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-primary">
+                    </div>
                 </div>
                 <div class="flex items-center">
                     <input type="checkbox" id="llm-default" class="w-4 h-4 rounded bg-gray-700 border-gray-600 text-primary focus:ring-primary">
@@ -697,7 +709,7 @@
         function showLLMModal(config = null) {
             document.getElementById('llm-modal').classList.remove('hidden');
             document.getElementById('llm-modal').classList.add('flex');
-            
+
             if (config) {
                 document.getElementById('llm-modal-title').textContent = '编辑 LLM 配置';
                 document.getElementById('llm-id').value = config.id;
@@ -707,11 +719,15 @@
                 document.getElementById('llm-api-key').value = '';
                 document.getElementById('llm-api-key').placeholder = config.api_key_masked + ' (留空则不修改)';
                 document.getElementById('llm-model').value = config.model;
+                document.getElementById('llm-max-tokens').value = config.max_tokens || '';
+                document.getElementById('llm-temperature').value = config.temperature !== null && config.temperature !== undefined ? config.temperature : '';
                 document.getElementById('llm-default').checked = config.is_default;
             } else {
                 document.getElementById('llm-modal-title').textContent = '添加 LLM 配置';
                 document.getElementById('llm-id').value = '';
                 document.getElementById('llm-api-key').placeholder = 'sk-xxx';
+                document.getElementById('llm-max-tokens').value = '';
+                document.getElementById('llm-temperature').value = '';
                 fillProviderDefaults();
             }
         }
@@ -723,6 +739,8 @@
             document.getElementById('llm-id').value = '';
             document.getElementById('llm-name').value = '';
             document.getElementById('llm-api-key').value = '';
+            document.getElementById('llm-max-tokens').value = '';
+            document.getElementById('llm-temperature').value = '';
             document.getElementById('llm-default').checked = false;
         }
 
@@ -751,6 +769,8 @@
             const base_url = document.getElementById('llm-base-url').value;
             const api_key = document.getElementById('llm-api-key').value;
             const model = document.getElementById('llm-model').value;
+            const max_tokens_input = document.getElementById('llm-max-tokens').value;
+            const temperature_input = document.getElementById('llm-temperature').value;
             const is_default = document.getElementById('llm-default').checked;
 
             if (!name) {
@@ -763,6 +783,21 @@
             }
 
             const payload = { name, provider, base_url, model, is_default };
+
+            // Handle optional max_tokens and temperature
+            if (max_tokens_input) {
+                const maxTokens = parseInt(max_tokens_input, 10);
+                if (maxTokens > 0) {
+                    payload.max_tokens = maxTokens;
+                }
+            }
+            if (temperature_input !== '') {
+                const temperature = parseFloat(temperature_input);
+                if (!isNaN(temperature)) {
+                    payload.temperature = temperature;
+                }
+            }
+
             if (api_key) {
                 payload.api_key = api_key;
             } else if (id) {

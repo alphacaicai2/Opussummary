@@ -326,6 +326,8 @@ def _init_db() -> None:
 
             llm_migrations = [
                 ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+                ("max_tokens", "INTEGER"),
+                ("temperature", "REAL"),
             ]
 
             for col_name, col_def in llm_migrations:
@@ -444,6 +446,8 @@ class LLMConfigBase(BaseModel):
     base_url: str = Field(..., min_length=1, description="API base URL")
     api_key: str = Field(..., min_length=1, description="API key")
     model: str = Field(..., min_length=1, description="Model name")
+    max_tokens: int | None = Field(default=None, ge=1, le=128000, description="Max tokens for generation")
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0, description="Temperature for generation")
     is_default: bool = Field(default=False, description="Set as default configuration")
 
 
@@ -460,6 +464,8 @@ class LLMConfigOut(BaseModel):
     base_url: str
     model: str
     api_key_masked: str = Field(..., description="Masked API key (e.g., sk-***abc)")
+    max_tokens: int | None = Field(default=None, description="Max tokens for generation")
+    temperature: float | None = Field(default=None, description="Temperature for generation")
     is_default: bool
     created_at: str
     updated_at: str
@@ -725,6 +731,8 @@ def _llm_row_to_model(row: sqlite3.Row) -> LLMConfigOut:
         base_url=row["base_url"],
         model=row["model"],
         api_key_masked=_mask_api_key(row["api_key"]),
+        max_tokens=row["max_tokens"] if "max_tokens" in row.keys() else None,
+        temperature=row["temperature"] if "temperature" in row.keys() else None,
         is_default=bool(row["is_default"]),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -938,7 +946,7 @@ def _resolve_llm_config(
         if llm_config_id is not None:
             row = conn.execute(
                 """
-                SELECT id, name, provider, base_url, api_key, model
+                SELECT id, name, provider, base_url, api_key, model, max_tokens, temperature
                 FROM llm_configs
                 WHERE id = ?
                 """,
@@ -961,7 +969,7 @@ def _resolve_llm_config(
         # Try to get default config
         row = conn.execute(
             """
-            SELECT id, name, provider, base_url, api_key, model
+            SELECT id, name, provider, base_url, api_key, model, max_tokens, temperature
             FROM llm_configs
             WHERE is_default = 1
             ORDER BY id DESC
@@ -975,7 +983,7 @@ def _resolve_llm_config(
         # Fallback: get first available config
         return conn.execute(
             """
-            SELECT id, name, provider, base_url, api_key, model
+            SELECT id, name, provider, base_url, api_key, model, max_tokens, temperature
             FROM llm_configs
             ORDER BY id ASC
             LIMIT 1
@@ -1297,6 +1305,19 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                 # Create briefing generator and request
                 generator = BriefingGenerator(llm_client=llm_client)
 
+                # Extract optional temperature and max_tokens from LLM config
+                llm_max_tokens = llm_row["max_tokens"] if "max_tokens" in llm_row.keys() else None
+                llm_temperature = llm_row["temperature"] if "temperature" in llm_row.keys() else None
+
+                # Log LLM generation parameters
+                logger.info(
+                    "=== LLM Generation Parameters ===\n"
+                    "  Max Tokens: %s\n"
+                    "  Temperature: %s",
+                    llm_max_tokens if llm_max_tokens else "(using default)",
+                    llm_temperature if llm_temperature is not None else "(using default)",
+                )
+
                 # Check for custom template in database
                 custom_template_kwargs = {}
                 template_id = raw_template.lower() if raw_template else "general"
@@ -1321,6 +1342,8 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                     output_format="markdown",
                     article_content_max_length=MAX_ARTICLE_CONTENT_CHARS,  # Pass limit to generator
                     prompt_char_budget=prompt_char_budget,  # Dynamic budget
+                    max_tokens=llm_max_tokens,
+                    temperature=llm_temperature,
                     **custom_template_kwargs,
                 )
 
@@ -1602,8 +1625,8 @@ def create_app() -> FastAPI:
                 """
                 INSERT INTO llm_configs (
                     name, provider, base_url, api_key, model,
-                    is_default, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    max_tokens, temperature, is_default, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     payload.name,
@@ -1611,6 +1634,8 @@ def create_app() -> FastAPI:
                     payload.base_url,
                     payload.api_key,
                     payload.model,
+                    payload.max_tokens,
+                    payload.temperature,
                     int(payload.is_default),
                     now,
                     now,
@@ -1645,7 +1670,7 @@ def create_app() -> FastAPI:
             exists = conn.execute("SELECT 1 FROM llm_configs WHERE id = ?", (config_id,)).fetchone()
             if not exists:
                 raise HTTPException(status_code=404, detail=f"LLM config not found: {config_id}")
-            
+
             # 如果设置为默认，先清除其他默认标记
             if payload.is_default:
                 conn.execute("UPDATE llm_configs SET is_default = 0 WHERE is_default = 1")
@@ -1655,7 +1680,7 @@ def create_app() -> FastAPI:
                 UPDATE llm_configs
                 SET
                     name = ?, provider = ?, base_url = ?, api_key = ?, model = ?,
-                    is_default = ?, updated_at = ?
+                    max_tokens = ?, temperature = ?, is_default = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -1664,6 +1689,8 @@ def create_app() -> FastAPI:
                     payload.base_url,
                     payload.api_key,
                     payload.model,
+                    payload.max_tokens,
+                    payload.temperature,
                     int(payload.is_default),
                     now,
                     config_id,
