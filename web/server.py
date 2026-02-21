@@ -21,6 +21,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Generator, Optional
+from uuid import uuid4
 
 import httpx
 from fastapi import Body, FastAPI, HTTPException, Query
@@ -2273,6 +2274,79 @@ def test_miniflux_connection(payload: MinifluxTestRequest) -> dict[str, Any]:
 
 
 # =============================================================================
+# Generate Job Queue (async API to avoid gateway timeout)
+# =============================================================================
+
+GENERATE_JOB_TTL_SECONDS = 60 * 60 * 6  # 6 hours
+_GENERATE_JOBS_LOCK = threading.Lock()
+_GENERATE_JOBS: dict[str, dict[str, Any]] = {}
+
+
+def _cleanup_generate_jobs(now_ts: float) -> None:
+    expired_ids: list[str] = []
+    for job_id, job in _GENERATE_JOBS.items():
+        finished_at = job.get("finished_at_ts")
+        if finished_at is None:
+            continue
+        if now_ts - float(finished_at) > GENERATE_JOB_TTL_SECONDS:
+            expired_ids.append(job_id)
+    for job_id in expired_ids:
+        _GENERATE_JOBS.pop(job_id, None)
+
+
+def _create_generate_job(payload: GenerateRequest) -> str:
+    now = time.time()
+    job_id = uuid4().hex
+    job = {
+        "job_id": job_id,
+        "status": "queued",  # queued | running | succeeded | failed
+        "error": None,
+        "result": None,
+        "created_at": _utcnow_iso(),
+        "updated_at": _utcnow_iso(),
+        "started_at": None,
+        "finished_at": None,
+        "finished_at_ts": None,
+    }
+    with _GENERATE_JOBS_LOCK:
+        _cleanup_generate_jobs(now)
+        _GENERATE_JOBS[job_id] = job
+    return job_id
+
+
+def _update_generate_job(job_id: str, **updates: Any) -> None:
+    with _GENERATE_JOBS_LOCK:
+        job = _GENERATE_JOBS.get(job_id)
+        if not job:
+            return
+        job.update(updates)
+        job["updated_at"] = _utcnow_iso()
+
+
+def _run_generate_job(job_id: str, payload: GenerateRequest) -> None:
+    _update_generate_job(job_id, status="running", started_at=_utcnow_iso())
+    try:
+        result = generate_briefing(payload)
+        _update_generate_job(
+            job_id,
+            status="succeeded",
+            result=result,
+            error=None,
+            finished_at=_utcnow_iso(),
+            finished_at_ts=time.time(),
+        )
+    except Exception as exc:
+        logger.exception("Async generate job failed: job_id=%s, error=%s", job_id, exc)
+        _update_generate_job(
+            job_id,
+            status="failed",
+            error=str(exc),
+            finished_at=_utcnow_iso(),
+            finished_at_ts=time.time(),
+        )
+
+
+# =============================================================================
 # FastAPI Application
 # =============================================================================
 
@@ -2707,6 +2781,33 @@ def create_app() -> FastAPI:
     # =========================================================================
     # Generate API
     # =========================================================================
+
+    @app.post("/api/generate-async", status_code=202)
+    def generate_async(payload: GenerateRequest) -> dict[str, Any]:
+        """Submit an async generation job and return job ID immediately."""
+        job_payload = payload.model_copy(deep=True)
+        job_id = _create_generate_job(job_payload)
+        worker = threading.Thread(
+            target=_run_generate_job,
+            args=(job_id, job_payload),
+            daemon=True,
+            name=f"generate-job-{job_id[:8]}",
+        )
+        worker.start()
+        return {
+            "job_id": job_id,
+            "status": "queued",
+            "poll_url": f"/api/generate-jobs/{job_id}",
+        }
+
+    @app.get("/api/generate-jobs/{job_id}")
+    def get_generate_job(job_id: str) -> dict[str, Any]:
+        """Get async generation job status/result."""
+        with _GENERATE_JOBS_LOCK:
+            job = _GENERATE_JOBS.get(job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail=f"Generate job not found: {job_id}")
+            return dict(job)
 
     @app.post("/api/generate")
     def generate(payload: GenerateRequest) -> dict[str, Any]:

@@ -1463,6 +1463,46 @@
                 state.tasks.map(t => `<option value="${t.id}">${t.name}</option>`).join('');
         }
 
+        function sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        }
+
+        async function waitGenerateJob(jobId, options = {}) {
+            const pollIntervalMs = options.pollIntervalMs || 2000;
+            const maxWaitMs = options.maxWaitMs || (25 * 60 * 1000);
+            const onProgress = options.onProgress;
+            const startedAt = Date.now();
+            let pollErrors = 0;
+
+            while (true) {
+                try {
+                    const job = await api(`/api/generate-jobs/${jobId}`);
+                    pollErrors = 0;
+
+                    if (typeof onProgress === 'function') {
+                        onProgress(job, Date.now() - startedAt);
+                    }
+
+                    if (job.status === 'succeeded') {
+                        return job;
+                    }
+                    if (job.status === 'failed') {
+                        throw new Error(job.error || '后台生成失败');
+                    }
+                } catch (e) {
+                    pollErrors += 1;
+                    if (pollErrors >= 5) {
+                        throw e;
+                    }
+                }
+
+                if (Date.now() - startedAt > maxWaitMs) {
+                    throw new Error('等待生成结果超时，请稍后在历史记录里查看');
+                }
+                await sleep(pollIntervalMs);
+            }
+        }
+
         async function runTask(id) {
             const btn = document.getElementById(`run-btn-${id}`);
             if (btn) {
@@ -1471,11 +1511,20 @@
             }
 
             try {
-                const result = await api('/api/generate', {
+                const submit = await api('/api/generate-async', {
                     method: 'POST',
                     body: { task_id: id }
                 });
-                showToast(`生成完成，共 ${result.article_count} 篇文章`);
+                const job = await waitGenerateJob(submit.job_id, {
+                    onProgress: (_job, elapsedMs) => {
+                        if (!btn) return;
+                        const sec = Math.floor(elapsedMs / 1000);
+                        btn.innerHTML = `<svg class="w-4 h-4 spinner text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg> ${sec}s`;
+                    }
+                });
+
+                const result = job.result || {};
+                showToast(`生成完成，共 ${result.article_count || 0} 篇文章`);
                 loadHistory(); // 自动刷新简报历史
             } catch (e) {
                 showToast('生成失败: ' + e.message, 'error');
@@ -1524,11 +1573,18 @@
             };
 
             try {
-                const result = await api('/api/generate', {
+                const submit = await api('/api/generate-async', {
                     method: 'POST',
                     body: payload
                 });
-                showToast(`生成完成，共 ${result.article_count} 篇文章`);
+                const job = await waitGenerateJob(submit.job_id, {
+                    onProgress: (_job, elapsedMs) => {
+                        const sec = Math.floor(elapsedMs / 1000);
+                        btn.innerHTML = `<svg class="w-5 h-5 mr-2 spinner" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg> 生成中 ${sec}s`;
+                    }
+                });
+                const result = job.result || {};
+                showToast(`生成完成，共 ${result.article_count || 0} 篇文章`);
                 showGenerateResult(result);
                 loadHistory(); // 自动刷新历史记录
             } catch (e) {
