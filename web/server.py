@@ -80,6 +80,11 @@ BRIEFING_TEMPLATES = {
 LLM_CONTEXT_WINDOW_TOKENS = 32768
 LLM_DEFAULT_MAX_TOKENS = 4096
 LLM_TOKEN_SAFETY_MARGIN = 1024
+# Reserve extra output space to absorb provider-side token accounting variance.
+# This is not a hard cap; it only reduces risk when max_tokens is near context edge.
+LLM_OUTPUT_RESERVE_MIN_TOKENS = 2048
+LLM_PROMPT_UNCERTAINTY_MIN_TOKENS = 256
+LLM_PROMPT_UNCERTAINTY_RATIO_DENOMINATOR = 50
 LLM_PROMPT_CHARS_PER_TOKEN = 1
 LLM_PROMPT_OVERHEAD_CHARS = 6000
 # Segment size for "every article must be read by LLM" mode.
@@ -282,8 +287,13 @@ def _resolve_effective_max_tokens_for_context(
 ) -> int:
     """Clamp output tokens for a specific context window."""
     configured = configured_max_tokens or LLM_DEFAULT_MAX_TOKENS
+    prompt_uncertainty_tokens = max(
+        LLM_PROMPT_UNCERTAINTY_MIN_TOKENS,
+        estimated_prompt_tokens // LLM_PROMPT_UNCERTAINTY_RATIO_DENOMINATOR,
+    )
+    reserved_tokens = max(LLM_TOKEN_SAFETY_MARGIN, LLM_OUTPUT_RESERVE_MIN_TOKENS) + prompt_uncertainty_tokens
     available_output = (
-        context_window_tokens - estimated_prompt_tokens - LLM_TOKEN_SAFETY_MARGIN
+        context_window_tokens - estimated_prompt_tokens - reserved_tokens
     )
     safe_available_output = max(1, available_output)
     return min(configured, safe_available_output)
@@ -357,13 +367,19 @@ def _resolve_effective_max_tokens(
 
 
 def _is_payload_too_large_error(exc: Exception) -> bool:
-    """Detect provider-side request body too large errors (HTTP 413)."""
+    """Detect provider-side payload/context overflow errors (HTTP 413/400)."""
     message = str(exc).lower()
     markers = (
         "413",
+        "400",
         "payload too large",
         "request entity too large",
         "entity too large",
+        "maximum context length",
+        "max context length",
+        "context length is",
+        "please reduce the length of either one",
+        "requested about",
     )
     return any(marker in message for marker in markers)
 

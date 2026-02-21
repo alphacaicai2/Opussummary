@@ -67,13 +67,19 @@ logger = logging.getLogger("opus.briefing.generator")
 
 
 def _is_payload_too_large_error(exc: Exception) -> bool:
-    """Detect provider-side request body too large errors (HTTP 413)."""
+    """Detect provider-side payload/context overflow errors (HTTP 413/400)."""
     message = str(exc).lower()
     markers = (
         "413",
+        "400",
         "payload too large",
         "request entity too large",
         "entity too large",
+        "maximum context length",
+        "max context length",
+        "context length is",
+        "please reduce the length of either one",
+        "requested about",
     )
     return any(marker in message for marker in markers)
 
