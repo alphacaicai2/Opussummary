@@ -2082,20 +2082,30 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                             temperature=llm_temperature,
                             **custom_template_kwargs,
                         )
-                        synthesis_result = generator.generate(synthesis_request)
-                        synthesis_markdown = (synthesis_result.markdown or "").strip()
-                        if synthesis_markdown:
-                            content = synthesis_markdown
-                            used_llm = True
-                            logger.info(
-                                "Grouped synthesis succeeded: template=%s, source_batches=%d",
-                                resolved_template.value,
-                                len(batch_results),
-                            )
-                        else:
-                            content = _merge_grouped_markdowns(batch_results)
-                            used_llm = True
-                            logger.info("Grouped synthesis returned empty content; fallback to merged batch markdown")
+                        try:
+                            synthesis_result = generator.generate(synthesis_request)
+                            synthesis_markdown = (synthesis_result.markdown or "").strip()
+                            if synthesis_markdown:
+                                content = synthesis_markdown
+                                used_llm = True
+                                logger.info(
+                                    "Grouped synthesis succeeded: template=%s, source_batches=%d",
+                                    resolved_template.value,
+                                    len(batch_results),
+                                )
+                            else:
+                                content = _merge_grouped_markdowns(batch_results)
+                                used_llm = True
+                                logger.info("Grouped synthesis returned empty content; fallback to merged batch markdown")
+                        except Exception as synthesis_exc:
+                            if _is_payload_too_large_error(synthesis_exc):
+                                content = _merge_grouped_markdowns(batch_results)
+                                used_llm = True
+                                logger.info(
+                                    "Grouped synthesis payload too large; fallback to merged batch markdown"
+                                )
+                            else:
+                                raise
                     else:
                         content = _merge_grouped_markdowns(batch_results)
                         used_llm = True
