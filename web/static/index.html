@@ -432,6 +432,9 @@
                             <span class="text-2xl font-bold text-gray-300">-</span>
                             <span class="text-sm text-gray-500 ml-1">篇</span>
                         </div>
+                        <div id="preview-token-result" class="mt-2 text-xs text-center text-gray-500">
+                            预计 Token: -
+                        </div>
                     </div>
                 </div>
 
@@ -1177,12 +1180,17 @@
             const timeRangeInput = document.getElementById('task-time-range');
             const time_range_hours = parseInt(timeRangeInput.value) || 24;
             const category_ids = Array.from(document.querySelectorAll('#task-categories input:checked')).map(cb => parseInt(cb.value));
+            const template = document.getElementById('task-template').value || null;
+            const llmSelectValue = document.getElementById('task-llm').value;
+            const llm_config_id = llmSelectValue ? parseInt(llmSelectValue) : null;
 
             const resultEl = document.getElementById('preview-count-result');
+            const tokenEl = document.getElementById('preview-token-result');
             const btn = document.getElementById('preview-count-btn');
 
             // Show loading state
             resultEl.innerHTML = '<svg class="w-5 h-5 spinner inline text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>';
+            tokenEl.innerHTML = '<span class="text-gray-500">正在估算 Token...</span>';
             btn.disabled = true;
 
             try {
@@ -1191,7 +1199,9 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         time_range_hours,
-                        category_ids: category_ids.length > 0 ? category_ids : null
+                        category_ids: category_ids.length > 0 ? category_ids : null,
+                        llm_config_id,
+                        template
                     })
                 });
 
@@ -1201,6 +1211,7 @@
 
                 const data = await response.json();
                 const count = data.count || 0;
+                const tokenPreview = data.token_preview || {};
 
                 // Update display with color based on count
                 let colorClass = 'text-gray-300';
@@ -1209,9 +1220,40 @@
                 else if (count >= 50) colorClass = 'text-green-400';
 
                 resultEl.innerHTML = `<span class="text-2xl font-bold ${colorClass}">${count}</span><span class="text-sm text-gray-500 ml-1">篇</span>`;
+
+                const contextWindow = tokenPreview.context_window_tokens || '-';
+                const estimatedPrompt = tokenPreview.estimated_prompt_tokens || 0;
+                const targetPrompt = tokenPreview.target_prompt_tokens || 0;
+                const usageRatio = typeof tokenPreview.usage_ratio === 'number' ? tokenPreview.usage_ratio : 0;
+                const usagePercent = Math.max(0, Math.round(usageRatio * 100));
+                const modelName = tokenPreview.model_name || '默认模型';
+                const desiredOutput = tokenPreview.desired_output_tokens || 0;
+                const effectiveOutput = tokenPreview.effective_output_tokens || 0;
+                const trimmedCount = tokenPreview.trimmed_count || 0;
+                const modelLimitSource = tokenPreview.model_limit_source === 'provider_models' ? '模型接口' : '本地回退';
+
+                let riskClass = 'text-green-400';
+                let riskText = 'Token 预算充足';
+                if (tokenPreview.over_limit || trimmedCount > 0) {
+                    riskClass = 'text-red-400';
+                    riskText = trimmedCount > 0
+                        ? `超预算风险，预计需裁剪 ${trimmedCount} 篇`
+                        : '超预算风险，当前内容已接近最小输入规模';
+                } else if (usageRatio >= 0.85) {
+                    riskClass = 'text-yellow-400';
+                    riskText = '接近预算上限，建议缩短时间范围或减少分组';
+                }
+
+                tokenEl.innerHTML = `
+                    <div class="text-gray-400">模型: ${escapeHtml(String(modelName))} | 上下文: <span class="text-gray-300">${contextWindow}</span> tokens (${modelLimitSource})</div>
+                    <div class="text-gray-400">预计输入: <span class="text-gray-300">${estimatedPrompt}</span> / <span class="text-gray-300">${targetPrompt}</span> tokens (${usagePercent}%)</div>
+                    <div class="text-gray-400">输出预算: <span class="text-gray-300">${effectiveOutput}</span> / ${desiredOutput} tokens</div>
+                    <div class="${riskClass}">${riskText}</div>
+                `;
             } catch (error) {
                 console.error('Preview count error:', error);
                 resultEl.innerHTML = '<span class="text-sm text-red-400">加载失败</span>';
+                tokenEl.innerHTML = '<span class="text-sm text-red-400">Token 估算失败</span>';
             } finally {
                 btn.disabled = false;
             }
@@ -1549,6 +1591,13 @@
 
         document.getElementById('task-template').addEventListener('change', function() {
             renderTemplateSectionsHint('task-template-sections-hint', this.value);
+            clearTimeout(window._previewCountTimeout);
+            window._previewCountTimeout = setTimeout(() => previewEntryCount(), 300);
+        });
+
+        document.getElementById('task-llm').addEventListener('change', function() {
+            clearTimeout(window._previewCountTimeout);
+            window._previewCountTimeout = setTimeout(() => previewEntryCount(), 300);
         });
 
         document.getElementById('gen-template').addEventListener('change', function() {

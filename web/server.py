@@ -15,6 +15,8 @@ import json
 import logging
 import os
 import sqlite3
+import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -77,6 +79,208 @@ LLM_DEFAULT_MAX_TOKENS = 4096
 LLM_TOKEN_SAFETY_MARGIN = 1024
 LLM_PROMPT_CHARS_PER_TOKEN = 1
 LLM_PROMPT_OVERHEAD_CHARS = 6000
+LLM_ARTICLE_CONTENT_CHAR_LIMIT = 2400
+MODEL_LIMIT_CACHE_TTL_SECONDS = 600
+
+_MODEL_LIMIT_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_MODEL_LIMIT_CACHE_LOCK = threading.Lock()
+
+_MODEL_CONTEXT_KEYS = {
+    "context_length",
+    "context_window",
+    "max_context_length",
+    "max_input_tokens",
+    "input_token_limit",
+    "max_sequence_length",
+    "max_seq_len",
+}
+_MODEL_OUTPUT_KEYS = {
+    "max_output_tokens",
+    "output_token_limit",
+    "max_completion_tokens",
+    "completion_token_limit",
+    "max_tokens",
+}
+
+
+def _to_int_or_none(value: Any) -> int | None:
+    """Convert value to int if possible and positive, otherwise None."""
+    if isinstance(value, (int, float)):
+        iv = int(value)
+        return iv if iv > 0 else None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            iv = int(text)
+            return iv if iv > 0 else None
+    return None
+
+
+def _find_numeric_by_keys(payload: Any, keys: set[str]) -> int | None:
+    """Recursively search dict/list payload for the first numeric key match."""
+    stack: list[Any] = [payload]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            for k, v in current.items():
+                if str(k).lower() in keys:
+                    iv = _to_int_or_none(v)
+                    if iv is not None:
+                        return iv
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
+        elif isinstance(current, list):
+            stack.extend(current)
+    return None
+
+
+def _pick_model_meta(payload: dict[str, Any], model_name: str) -> dict[str, Any] | None:
+    """Pick model metadata entry from provider /models payload."""
+    candidates: list[dict[str, Any]] = []
+    for key in ("data", "models", "items"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            candidates = [item for item in value if isinstance(item, dict)]
+            if candidates:
+                break
+    if not candidates:
+        return None
+
+    needle = (model_name or "").strip().lower()
+    if not needle:
+        return candidates[0]
+
+    for item in candidates:
+        item_id = str(item.get("id") or item.get("model") or "").strip().lower()
+        if item_id == needle:
+            return item
+    for item in candidates:
+        item_id = str(item.get("id") or item.get("model") or "").strip().lower()
+        if needle in item_id or item_id in needle:
+            return item
+    return candidates[0]
+
+
+def _build_provider_headers(provider: str, api_key: str) -> dict[str, str]:
+    """Build auth headers for provider model metadata requests."""
+    p = (provider or "").strip().lower()
+    if p == "anthropic":
+        return {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        }
+    return {"Authorization": f"Bearer {api_key}"}
+
+
+def _resolve_model_limits(llm_row: sqlite3.Row) -> dict[str, Any]:
+    """
+    Resolve model context/output limits from provider metadata with cache.
+    """
+    provider = str(llm_row["provider"] or "").strip().lower()
+    base_url = str(llm_row["base_url"] or "").strip().rstrip("/")
+    api_key = str(llm_row["api_key"] or "").strip()
+    model = str(llm_row["model"] or "").strip()
+    cache_key = f"{provider}|{base_url}|{model}"
+
+    now = time.time()
+    with _MODEL_LIMIT_CACHE_LOCK:
+        cached = _MODEL_LIMIT_CACHE.get(cache_key)
+        if cached and now - cached[0] < MODEL_LIMIT_CACHE_TTL_SECONDS:
+            return dict(cached[1])
+
+    limits: dict[str, Any] = {
+        "source": "fallback",
+        "context_window_tokens": LLM_CONTEXT_WINDOW_TOKENS,
+        "max_output_tokens": None,
+    }
+
+    if not base_url or not api_key:
+        return limits
+
+    try:
+        headers = _build_provider_headers(provider, api_key)
+        resp = httpx.get(f"{base_url}/models", headers=headers, timeout=10.0)
+        if 200 <= resp.status_code < 300:
+            payload = resp.json() if resp.content else {}
+            if isinstance(payload, dict):
+                meta = _pick_model_meta(payload, model) or payload
+                context_limit = _find_numeric_by_keys(meta, _MODEL_CONTEXT_KEYS)
+                output_limit = _find_numeric_by_keys(meta, _MODEL_OUTPUT_KEYS)
+                if context_limit is not None:
+                    limits["context_window_tokens"] = context_limit
+                limits["max_output_tokens"] = output_limit
+                limits["source"] = "provider_models"
+    except Exception as exc:
+        logger.debug("Failed to fetch model limits for %s: %s", model, exc)
+
+    with _MODEL_LIMIT_CACHE_LOCK:
+        _MODEL_LIMIT_CACHE[cache_key] = (now, dict(limits))
+    return limits
+
+
+def _estimate_prompt_char_budget_for_context(
+    context_window_tokens: int,
+    configured_max_tokens: int | None,
+) -> int:
+    """Estimate prompt char budget for a specific context window."""
+    desired_output_tokens = configured_max_tokens or LLM_DEFAULT_MAX_TOKENS
+    available_prompt_tokens = max(
+        0,
+        context_window_tokens - desired_output_tokens - LLM_TOKEN_SAFETY_MARGIN,
+    )
+    return available_prompt_tokens * LLM_PROMPT_CHARS_PER_TOKEN
+
+
+def _target_prompt_tokens_for_context(
+    context_window_tokens: int,
+    desired_output_tokens: int,
+) -> int:
+    """Compute prompt token target for a specific context window."""
+    return max(
+        1,
+        context_window_tokens - desired_output_tokens - LLM_TOKEN_SAFETY_MARGIN,
+    )
+
+
+def _trim_articles_to_fit_context_window_for_context(
+    articles: list[dict[str, str]],
+    desired_output_tokens: int,
+    context_window_tokens: int,
+) -> tuple[int, int]:
+    """
+    Trim tail articles until estimated prompt tokens fit target budget.
+
+    Returns:
+        (trimmed_count, target_prompt_tokens)
+    """
+    target_prompt_tokens = _target_prompt_tokens_for_context(
+        context_window_tokens,
+        desired_output_tokens,
+    )
+    trimmed_count = 0
+
+    while len(articles) > 1:
+        estimated_prompt_tokens = _estimate_prompt_tokens_from_articles(articles)
+        if estimated_prompt_tokens <= target_prompt_tokens:
+            break
+        articles.pop()
+        trimmed_count += 1
+
+    return trimmed_count, target_prompt_tokens
+
+
+def _resolve_effective_max_tokens_for_context(
+    context_window_tokens: int,
+    configured_max_tokens: int | None,
+    estimated_prompt_tokens: int,
+) -> int:
+    """Clamp output tokens for a specific context window."""
+    configured = configured_max_tokens or LLM_DEFAULT_MAX_TOKENS
+    available_output = (
+        context_window_tokens - estimated_prompt_tokens - LLM_TOKEN_SAFETY_MARGIN
+    )
+    safe_available_output = max(1, available_output)
+    return min(configured, safe_available_output)
 
 
 def _estimate_prompt_char_budget(configured_max_tokens: int | None) -> int:
@@ -86,12 +290,10 @@ def _estimate_prompt_char_budget(configured_max_tokens: int | None) -> int:
     No fixed hard cap is applied here; budget is derived from
     model context window, desired output tokens, and safety margin.
     """
-    desired_output_tokens = configured_max_tokens or LLM_DEFAULT_MAX_TOKENS
-    available_prompt_tokens = max(
-        0,
-        LLM_CONTEXT_WINDOW_TOKENS - desired_output_tokens - LLM_TOKEN_SAFETY_MARGIN,
+    return _estimate_prompt_char_budget_for_context(
+        LLM_CONTEXT_WINDOW_TOKENS,
+        configured_max_tokens,
     )
-    return available_prompt_tokens * LLM_PROMPT_CHARS_PER_TOKEN
 
 
 def _estimate_prompt_tokens_from_articles(articles: list[dict[str, str]]) -> int:
@@ -111,9 +313,9 @@ def _estimate_prompt_tokens_from_articles(articles: list[dict[str, str]]) -> int
 
 def _target_prompt_tokens(desired_output_tokens: int) -> int:
     """Compute prompt token budget from context window and desired output."""
-    return max(
-        1,
-        LLM_CONTEXT_WINDOW_TOKENS - desired_output_tokens - LLM_TOKEN_SAFETY_MARGIN,
+    return _target_prompt_tokens_for_context(
+        LLM_CONTEXT_WINDOW_TOKENS,
+        desired_output_tokens,
     )
 
 
@@ -127,17 +329,11 @@ def _trim_articles_to_fit_context_window(
     Returns:
         (trimmed_count, target_prompt_tokens)
     """
-    target_prompt_tokens = _target_prompt_tokens(desired_output_tokens)
-    trimmed_count = 0
-
-    while len(articles) > 1:
-        estimated_prompt_tokens = _estimate_prompt_tokens_from_articles(articles)
-        if estimated_prompt_tokens <= target_prompt_tokens:
-            break
-        articles.pop()
-        trimmed_count += 1
-
-    return trimmed_count, target_prompt_tokens
+    return _trim_articles_to_fit_context_window_for_context(
+        articles,
+        desired_output_tokens,
+        LLM_CONTEXT_WINDOW_TOKENS,
+    )
 
 
 def _resolve_effective_max_tokens(
@@ -147,12 +343,154 @@ def _resolve_effective_max_tokens(
     """
     Clamp output tokens to fit within context window after prompt tokens.
     """
-    configured = configured_max_tokens or LLM_DEFAULT_MAX_TOKENS
-    available_output = (
-        LLM_CONTEXT_WINDOW_TOKENS - estimated_prompt_tokens - LLM_TOKEN_SAFETY_MARGIN
+    return _resolve_effective_max_tokens_for_context(
+        LLM_CONTEXT_WINDOW_TOKENS,
+        configured_max_tokens,
+        estimated_prompt_tokens,
     )
-    safe_available_output = max(1, available_output)
-    return min(configured, safe_available_output)
+
+
+def _truncate_articles_for_prompt_budget(
+    articles: list[dict[str, str]],
+    *,
+    max_article_content_chars: int,
+    prompt_char_budget: int,
+) -> tuple[list[dict[str, str]], int]:
+    """
+    Truncate article content to fit prompt budget while preserving recency order.
+
+    Returns:
+        (truncated_articles, total_content_chars)
+    """
+    total_chars = 0
+    truncated_articles: list[dict[str, str]] = []
+    ellipsis = "..."
+
+    for article in articles:
+        content = article.get("content", "")
+        if len(content) > max_article_content_chars:
+            keep = max_article_content_chars - len(ellipsis)
+            if keep > 0:
+                content = content[:keep] + ellipsis
+            else:
+                content = content[:max_article_content_chars]
+            article = {**article, "content": content}
+
+        if total_chars + len(content) > prompt_char_budget:
+            remaining = prompt_char_budget - total_chars
+            if remaining > 0:
+                if len(content) > remaining:
+                    keep = remaining - len(ellipsis)
+                    if keep > 0:
+                        content = content[:keep] + ellipsis
+                    else:
+                        content = content[:remaining]
+                article = {**article, "content": content}
+                truncated_articles.append(article)
+                total_chars += len(content)
+            break
+
+        truncated_articles.append(article)
+        total_chars += len(content)
+
+    return truncated_articles, total_chars
+
+
+def _resolve_context_plan_for_llm(llm_row: sqlite3.Row | None) -> dict[str, Any]:
+    """
+    Resolve context/output plan for one LLM config.
+
+    This keeps preview and generation using the same budgeting logic.
+    """
+    configured_max_tokens: int | None = None
+    context_window_tokens = LLM_CONTEXT_WINDOW_TOKENS
+    model_max_output_tokens: int | None = None
+    model_limit_source = "fallback"
+    model_name: str | None = None
+    llm_config_id: int | None = None
+
+    if llm_row is not None:
+        configured_max_tokens = _to_int_or_none(
+            llm_row["max_tokens"] if "max_tokens" in llm_row.keys() else None
+        )
+        model_name = str(llm_row["model"] or "").strip() or None
+        llm_config_id = _to_int_or_none(llm_row["id"] if "id" in llm_row.keys() else None)
+        limits = _resolve_model_limits(llm_row)
+        context_window_tokens = (
+            _to_int_or_none(limits.get("context_window_tokens")) or LLM_CONTEXT_WINDOW_TOKENS
+        )
+        model_max_output_tokens = _to_int_or_none(limits.get("max_output_tokens"))
+        model_limit_source = str(limits.get("source") or "fallback")
+
+    desired_output_tokens = configured_max_tokens or LLM_DEFAULT_MAX_TOKENS
+    if model_max_output_tokens is not None:
+        desired_output_tokens = min(desired_output_tokens, model_max_output_tokens)
+
+    prompt_char_budget = _estimate_prompt_char_budget_for_context(
+        context_window_tokens,
+        desired_output_tokens,
+    )
+    target_prompt_tokens = _target_prompt_tokens_for_context(
+        context_window_tokens,
+        desired_output_tokens,
+    )
+
+    return {
+        "llm_config_id": llm_config_id,
+        "model_name": model_name,
+        "model_limit_source": model_limit_source,
+        "context_window_tokens": context_window_tokens,
+        "configured_max_tokens": configured_max_tokens,
+        "model_max_output_tokens": model_max_output_tokens,
+        "desired_output_tokens": desired_output_tokens,
+        "prompt_char_budget": prompt_char_budget,
+        "target_prompt_tokens": target_prompt_tokens,
+    }
+
+
+def _build_token_preview(entries: list[dict[str, Any]], llm_row: sqlite3.Row | None) -> dict[str, Any]:
+    """Build token estimate preview for current filters and model selection."""
+    plan = _resolve_context_plan_for_llm(llm_row)
+    articles = _prepare_articles_for_briefing(entries)
+    articles, total_content_chars = _truncate_articles_for_prompt_budget(
+        articles,
+        max_article_content_chars=LLM_ARTICLE_CONTENT_CHAR_LIMIT,
+        prompt_char_budget=plan["prompt_char_budget"],
+    )
+
+    estimated_prompt_tokens = _estimate_prompt_tokens_from_articles(articles)
+    effective_output_tokens = _resolve_effective_max_tokens_for_context(
+        plan["context_window_tokens"],
+        plan["desired_output_tokens"],
+        estimated_prompt_tokens,
+    )
+
+    trim_probe = list(articles)
+    trimmed_count, _ = _trim_articles_to_fit_context_window_for_context(
+        trim_probe,
+        plan["desired_output_tokens"],
+        plan["context_window_tokens"],
+    )
+
+    over_limit = estimated_prompt_tokens > plan["target_prompt_tokens"]
+    usage_ratio = (
+        float(estimated_prompt_tokens) / float(plan["target_prompt_tokens"])
+        if plan["target_prompt_tokens"] > 0
+        else 1.0
+    )
+
+    return {
+        **plan,
+        "article_count_for_estimate": len(articles),
+        "article_count_after_trim": len(trim_probe),
+        "trimmed_count": trimmed_count,
+        "content_chars_for_estimate": total_content_chars,
+        "estimated_prompt_tokens": estimated_prompt_tokens,
+        "effective_output_tokens": effective_output_tokens,
+        "over_limit": over_limit,
+        "usage_ratio": usage_ratio,
+        "safety_margin_tokens": LLM_TOKEN_SAFETY_MARGIN,
+    }
 
 
 # =============================================================================
@@ -678,6 +1016,8 @@ class PreviewCountRequest(BaseModel):
     """Model for previewing entry count."""
     category_ids: list[int] | None = Field(default=None, description="Category IDs to filter (None = all)")
     time_range_hours: int | None = Field(default=24, ge=1, le=168, description="Hours to look back")
+    llm_config_id: int | None = Field(default=None, description="Optional LLM config ID for token estimation")
+    template: str | None = Field(default=None, description="Optional template ID for future prompt estimation")
 
 
 class GenerateRequest(BaseModel):
@@ -1229,8 +1569,6 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
     Raises:
         HTTPException: If task not found or explicit LLM config not found
     """
-    # Token limit constants (prevent LLM context overflow)
-    MAX_ARTICLE_CONTENT_CHARS = 2400  # Max characters per article content
     # No article count limit - dynamic budget handles large article sets
 
     # Resolve task if specified
@@ -1334,53 +1672,26 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                 articles = _prepare_articles_for_briefing(entries)
 
                 # Extract optional generation knobs from LLM config.
-                llm_max_tokens = llm_row["max_tokens"] if "max_tokens" in llm_row.keys() else None
                 llm_temperature = llm_row["temperature"] if "temperature" in llm_row.keys() else None
 
-                # Build a bounded prompt budget instead of unbounded per-entry expansion.
-                prompt_char_budget = _estimate_prompt_char_budget(llm_max_tokens)
+                plan = _resolve_context_plan_for_llm(llm_row)
+                prompt_char_budget = plan["prompt_char_budget"]
                 logger.info(
-                    "Prompt budget planning: entries=%d, configured_max_tokens=%s, prompt_char_budget=%d",
+                    "Prompt budget planning: entries=%d, context_window=%d, configured_max_tokens=%s, desired_output_tokens=%d, prompt_char_budget=%d, model_limit_source=%s",
                     len(entries),
-                    llm_max_tokens if llm_max_tokens is not None else "(default)",
+                    plan["context_window_tokens"],
+                    plan["configured_max_tokens"] if plan["configured_max_tokens"] is not None else "(default)",
+                    plan["desired_output_tokens"],
                     prompt_char_budget,
+                    plan["model_limit_source"],
                 )
 
                 # Truncate article content to prevent token overflow
-                total_chars = 0
-                truncated_articles: list[dict[str, str]] = []
-                ellipsis = "..."
-                for article in articles:
-                    content = article.get("content", "")
-                    # Truncate individual article content if too long
-                    if len(content) > MAX_ARTICLE_CONTENT_CHARS:
-                        keep = MAX_ARTICLE_CONTENT_CHARS - len(ellipsis)
-                        if keep > 0:
-                            content = content[:keep] + ellipsis
-                        else:
-                            content = content[:MAX_ARTICLE_CONTENT_CHARS]
-                        article = {**article, "content": content}
-
-                    # Check if adding this article would exceed total budget
-                    if total_chars + len(content) > prompt_char_budget:
-                        # Truncate content to fit remaining budget
-                        remaining = prompt_char_budget - total_chars
-                        if remaining > 0:
-                            if len(content) > remaining:
-                                keep = remaining - len(ellipsis)
-                                if keep > 0:
-                                    content = content[:keep] + ellipsis
-                                else:
-                                    content = content[:remaining]
-                            article = {**article, "content": content}
-                            truncated_articles.append(article)
-                            total_chars += len(content)
-                        break
-
-                    truncated_articles.append(article)
-                    total_chars += len(content)
-
-                articles = truncated_articles
+                articles, total_chars = _truncate_articles_for_prompt_budget(
+                    articles,
+                    max_article_content_chars=LLM_ARTICLE_CONTENT_CHAR_LIMIT,
+                    prompt_char_budget=prompt_char_budget,
+                )
                 logger.info(
                     "Prepared %d articles for LLM (total chars: %d, budget: %d)",
                     len(articles),
@@ -1388,10 +1699,10 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                     prompt_char_budget,
                 )
 
-                desired_output_tokens = llm_max_tokens or LLM_DEFAULT_MAX_TOKENS
-                trimmed_count, target_prompt_tokens = _trim_articles_to_fit_context_window(
+                trimmed_count, target_prompt_tokens = _trim_articles_to_fit_context_window_for_context(
                     articles,
-                    desired_output_tokens,
+                    plan["desired_output_tokens"],
+                    plan["context_window_tokens"],
                 )
                 if trimmed_count > 0:
                     logger.warning(
@@ -1400,11 +1711,12 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                     )
 
                 estimated_prompt_tokens = _estimate_prompt_tokens_from_articles(articles)
-                effective_max_tokens = _resolve_effective_max_tokens(
-                    desired_output_tokens,
+                effective_max_tokens = _resolve_effective_max_tokens_for_context(
+                    plan["context_window_tokens"],
+                    plan["desired_output_tokens"],
                     estimated_prompt_tokens,
                 )
-                if effective_max_tokens < desired_output_tokens:
+                if effective_max_tokens < plan["desired_output_tokens"]:
                     logger.warning(
                         "Prompt is still near context limit (target_prompt_tokens=%d, estimated=%d); max_tokens reduced to %d",
                         target_prompt_tokens,
@@ -1418,11 +1730,17 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                 # Log LLM generation parameters
                 logger.info(
                     "=== LLM Generation Parameters ===\n"
+                    "  Context Window Tokens: %d\n"
+                    "  Model Limit Source: %s\n"
                     "  Max Tokens (configured): %s\n"
+                    "  Max Tokens (desired): %d\n"
                     "  Max Tokens (effective): %s\n"
                     "  Estimated Prompt Tokens: %d\n"
                     "  Temperature: %s",
-                    llm_max_tokens if llm_max_tokens is not None else "(using default)",
+                    plan["context_window_tokens"],
+                    plan["model_limit_source"],
+                    plan["configured_max_tokens"] if plan["configured_max_tokens"] is not None else "(using default)",
+                    plan["desired_output_tokens"],
                     effective_max_tokens,
                     estimated_prompt_tokens,
                     llm_temperature if llm_temperature is not None else "(using default)",
@@ -1450,7 +1768,7 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                     timezone=task_timezone,
                     time_range_hours=time_range_hours,
                     output_format="markdown",
-                    article_content_max_length=MAX_ARTICLE_CONTENT_CHARS,  # Pass limit to generator
+                    article_content_max_length=LLM_ARTICLE_CONTENT_CHAR_LIMIT,
                     prompt_char_budget=prompt_char_budget,
                     max_tokens=effective_max_tokens,
                     temperature=llm_temperature,
@@ -2054,7 +2372,7 @@ def create_app() -> FastAPI:
         Preview the number of entries that match the given filters.
 
         This is used in the task editor to show users how many articles
-        will be included before they save the task.
+        will be included before they save the task, plus token budget risk.
         """
         url, token = _resolve_miniflux_config()
         entries = _collect_entries(
@@ -2063,10 +2381,14 @@ def create_app() -> FastAPI:
             category_ids=payload.category_ids or [],
             time_range_hours=payload.time_range_hours or 24,
         )
+        llm_row = _resolve_llm_config(payload.llm_config_id, strict=False)
+        token_preview = _build_token_preview(entries, llm_row)
         return {
             "count": len(entries),
             "time_range_hours": payload.time_range_hours or 24,
             "category_ids": payload.category_ids or [],
+            "template": payload.template,
+            "token_preview": token_preview,
         }
 
     # =========================================================================
