@@ -87,6 +87,12 @@ LLM_PROMPT_UNCERTAINTY_MIN_TOKENS = 256
 LLM_PROMPT_UNCERTAINTY_RATIO_DENOMINATOR = 50
 LLM_PROMPT_CHARS_PER_TOKEN = 1
 LLM_PROMPT_OVERHEAD_CHARS = 6000
+# Relevance filtering before main briefing generation
+LLM_RELEVANCE_SCORE_THRESHOLD = 50
+LLM_RELEVANCE_BATCH_SIZE = 20
+LLM_RELEVANCE_SUMMARY_CHAR_LIMIT = 800
+LLM_RELEVANCE_MAX_TOKENS = 1800
+LLM_RELEVANCE_TEMPERATURE = 0.0
 # Segment size for "every article must be read by LLM" mode.
 # Long articles are split into multiple segments instead of being dropped.
 LLM_ARTICLE_CONTENT_CHAR_LIMIT = 2400
@@ -95,6 +101,11 @@ LLM_BATCH_SYNTHESIS_ARTICLE_CONTENT_CHAR_LIMIT = 3200
 
 _MODEL_LIMIT_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _MODEL_LIMIT_CACHE_LOCK = threading.Lock()
+
+
+class _SkipMainGeneration(Exception):
+    """Internal control-flow signal for intentional no-generation path."""
+
 
 _MODEL_CONTEXT_KEYS = {
     "context_length",
@@ -1538,6 +1549,231 @@ def _build_briefing_markdown(template: str, entries: list[dict[str, Any]]) -> st
     return "\n".join(lines)
 
 
+def _entry_relevance_summary(entry: dict[str, Any]) -> str:
+    """Build compact summary text for relevance scoring."""
+    raw = (
+        entry.get("summary")
+        or entry.get("description")
+        or entry.get("content")
+        or ""
+    )
+    text = " ".join(str(raw).split())
+    return text[:LLM_RELEVANCE_SUMMARY_CHAR_LIMIT]
+
+
+def _extract_json_payload_text(raw_text: str) -> str:
+    """Extract JSON payload from model output (supports fenced blocks)."""
+    text = (raw_text or "").strip()
+    if not text:
+        raise ValueError("empty response")
+
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 3 and lines[-1].strip().startswith("```"):
+            inner = "\n".join(lines[1:-1]).strip()
+            if inner.lower().startswith("json"):
+                inner = inner[4:].strip()
+            text = inner
+
+    try:
+        json.loads(text)
+        return text
+    except Exception:
+        pass
+
+    for open_ch, close_ch in (("[", "]"), ("{", "}")):
+        start = text.find(open_ch)
+        end = text.rfind(close_ch)
+        if start == -1 or end == -1 or end <= start:
+            continue
+        candidate = text[start:end + 1]
+        try:
+            json.loads(candidate)
+            return candidate
+        except Exception:
+            continue
+
+    raise ValueError("no valid json payload in model response")
+
+
+def _parse_relevance_scores(
+    response_text: str,
+    expected_indexes: set[int],
+) -> dict[int, tuple[int, str]]:
+    """Parse relevance scores from model JSON output."""
+    payload_text = _extract_json_payload_text(response_text)
+    payload = json.loads(payload_text)
+
+    items: list[Any]
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        maybe_items = payload.get("items") or payload.get("results") or payload.get("scores") or []
+        items = maybe_items if isinstance(maybe_items, list) else []
+    else:
+        items = []
+
+    scores: dict[int, tuple[int, str]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        idx_raw = item.get("idx", item.get("index"))
+        if idx_raw is None:
+            continue
+        try:
+            idx = int(idx_raw)
+        except Exception:
+            continue
+        if idx not in expected_indexes:
+            continue
+
+        score_raw = item.get("score", item.get("relevance_score"))
+        try:
+            score = int(round(float(score_raw)))
+        except Exception:
+            continue
+        score = max(0, min(100, score))
+        reason = str(item.get("reason") or item.get("rationale") or "").strip()
+        scores[idx] = (score, reason)
+    return scores
+
+
+def _filter_entries_by_relevance_with_llm(
+    entries: list[dict[str, Any]],
+    *,
+    template_key: str,
+    llm_client: LLMClient,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    Filter entries by LLM relevance score.
+
+    Returns:
+        (kept_entries, filtered_out_entries_with_score)
+    """
+    if not entries:
+        return [], []
+
+    template_info = BRIEFING_TEMPLATES.get(template_key, BRIEFING_TEMPLATES["general"])
+    template_name = str(template_info.get("name") or template_key)
+    template_desc = str(template_info.get("description") or "")
+
+    queue: list[list[int]] = []
+    for start in range(0, len(entries), LLM_RELEVANCE_BATCH_SIZE):
+        queue.append(list(range(start, min(start + LLM_RELEVANCE_BATCH_SIZE, len(entries)))))
+
+    scored: dict[int, tuple[int, str]] = {}
+
+    while queue:
+        batch_indexes = queue.pop(0)
+        batch_payload = []
+        for idx in batch_indexes:
+            entry = entries[idx]
+            feed = entry.get("feed") or {}
+            category = feed.get("category") or {}
+            batch_payload.append(
+                {
+                    "idx": idx,
+                    "title": str(entry.get("title") or "").strip(),
+                    "summary": _entry_relevance_summary(entry),
+                    "source": str(feed.get("title") or "Unknown Feed").strip(),
+                    "category": str(category.get("title") or category.get("id") or "").strip(),
+                }
+            )
+
+        scoring_system_prompt = (
+            "你是新闻相关性打分器。你只能输出 JSON，不允许任何额外文字。"
+        )
+        scoring_user_prompt = (
+            f"任务模板: {template_name}\n"
+            f"模板说明: {template_desc}\n\n"
+            "请根据标题和摘要判断文章是否与该任务模板相关，返回 0-100 分。\n"
+            f"评分规则: >= {LLM_RELEVANCE_SCORE_THRESHOLD} 视为相关，< {LLM_RELEVANCE_SCORE_THRESHOLD} 视为低相关。\n"
+            "输出必须是 JSON 数组，每个元素格式如下:\n"
+            "{\"idx\": <原始 idx 整数>, \"score\": <0-100整数>, \"reason\": \"一句话理由\"}\n\n"
+            "候选文章:\n"
+            f"{json.dumps(batch_payload, ensure_ascii=False)}"
+        )
+
+        try:
+            response_text = llm_client.complete(
+                system_prompt=scoring_system_prompt,
+                user_prompt=scoring_user_prompt,
+                temperature=LLM_RELEVANCE_TEMPERATURE,
+                max_tokens=LLM_RELEVANCE_MAX_TOKENS,
+            )
+            parsed = _parse_relevance_scores(response_text, set(batch_indexes))
+            for idx in batch_indexes:
+                if idx in parsed:
+                    scored[idx] = parsed[idx]
+                else:
+                    # Fail-open: missing score keeps the article.
+                    scored[idx] = (100, "missing_score_keep")
+        except Exception as exc:
+            if _is_payload_too_large_error(exc) and len(batch_indexes) > 1:
+                mid = len(batch_indexes) // 2
+                queue = [batch_indexes[:mid], batch_indexes[mid:]] + queue
+                logger.info(
+                    "Relevance scoring payload too large; split and retry: old=%d, left=%d, right=%d",
+                    len(batch_indexes),
+                    mid,
+                    len(batch_indexes) - mid,
+                )
+                continue
+            logger.warning("Relevance scoring failed for batch; keep all entries in batch: error=%s", exc)
+            for idx in batch_indexes:
+                scored[idx] = (100, "scoring_failed_keep")
+
+    kept_entries: list[dict[str, Any]] = []
+    filtered_entries: list[dict[str, Any]] = []
+    for idx, entry in enumerate(entries):
+        score, reason = scored.get(idx, (100, "unscored_keep"))
+        if score < LLM_RELEVANCE_SCORE_THRESHOLD:
+            feed = entry.get("feed") or {}
+            filtered_entries.append(
+                {
+                    "title": str(entry.get("title") or "无标题").strip(),
+                    "url": str(entry.get("url") or "").strip(),
+                    "source": str(feed.get("title") or "Unknown Feed").strip(),
+                    "score": score,
+                    "reason": reason,
+                }
+            )
+        else:
+            kept_entries.append(entry)
+
+    return kept_entries, filtered_entries
+
+
+def _append_filtered_titles_section(content: str, filtered_entries: list[dict[str, Any]]) -> str:
+    """Append low-relevance titles to the end of briefing content."""
+    if not filtered_entries:
+        return content
+
+    lines = [
+        (content or "").rstrip(),
+        "",
+        "---",
+        "",
+        f"## 低相关性文章（评分 < {LLM_RELEVANCE_SCORE_THRESHOLD}，未进入主生成）",
+        "",
+        "以下文章被相关性筛选排除，但保留标题供快速浏览：",
+        "",
+    ]
+    for idx, item in enumerate(filtered_entries, 1):
+        title = str(item.get("title") or "无标题").strip()
+        source = str(item.get("source") or "").strip()
+        score = item.get("score")
+        prefix = f"{idx}. [{score}分] {title}" if score is not None else f"{idx}. {title}"
+        if source:
+            prefix += f"（{source}）"
+        lines.append(prefix)
+        url = str(item.get("url") or "").strip()
+        if url:
+            lines.append(f"   - {url}")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def _resolve_llm_config(
     llm_config_id: int | None,
     *,
@@ -1804,9 +2040,11 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
     # Collect entries from Miniflux
     url, token = _resolve_miniflux_config()
     entries = _collect_entries(url, token, category_ids, time_range_hours)
+    entries_for_generation = list(entries)
+    filtered_out_entries: list[dict[str, Any]] = []
 
     # Prepare fallback content (simple list format)
-    fallback_content = _build_briefing_markdown(raw_template, entries)
+    fallback_content = _build_briefing_markdown(raw_template, entries_for_generation)
     content = fallback_content
     error_message: str | None = None
     used_llm = False
@@ -1865,9 +2103,34 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                 if task_row is not None and task_row["timezone"]:
                     task_timezone = str(task_row["timezone"])
 
+                # Relevance pre-filter: low-score entries are excluded from main generation.
+                entries_for_generation, filtered_out_entries = _filter_entries_by_relevance_with_llm(
+                    entries,
+                    template_key=resolved_template.value,
+                    llm_client=llm_client,
+                )
+                logger.info(
+                    "Relevance filter result: total=%d, kept=%d, filtered_out=%d, threshold=%d",
+                    len(entries),
+                    len(entries_for_generation),
+                    len(filtered_out_entries),
+                    LLM_RELEVANCE_SCORE_THRESHOLD,
+                )
+
+                # Rebuild fallback content based on kept entries.
+                fallback_content = _build_briefing_markdown(raw_template, entries_for_generation)
+                content = fallback_content
+
+                if not entries_for_generation:
+                    logger.info("All entries filtered out by relevance scoring; skipping main LLM generation")
+                    used_llm = False
+                    status = "success"
+                    error_message = None
+                    raise _SkipMainGeneration("no entries after relevance filter")
+
                 # Prepare articles for briefing generator
                 # Articles are already sorted by recency in _collect_entries
-                articles = _prepare_articles_for_briefing(entries)
+                articles = _prepare_articles_for_briefing(entries_for_generation)
 
                 # Extract optional generation knobs from LLM config.
                 llm_temperature = llm_row["temperature"] if "temperature" in llm_row.keys() else None
@@ -1876,7 +2139,7 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                 prompt_char_budget = plan["prompt_char_budget"]
                 logger.info(
                     "Prompt budget planning: entries=%d, context_window=%d, configured_max_tokens=%s, desired_output_tokens=%d, prompt_char_budget=%d, model_limit_source=%s",
-                    len(entries),
+                    len(entries_for_generation),
                     plan["context_window_tokens"],
                     plan["configured_max_tokens"] if plan["configured_max_tokens"] is not None else "(default)",
                     plan["desired_output_tokens"],
@@ -2048,7 +2311,7 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                         "LLM briefing generated successfully: template=%s, articles=%d (of %d), batches=1",
                         resolved_template.value,
                         batch_results[0]["article_count"],
-                        len(entries),
+                        len(entries_for_generation),
                     )
                 else:
                     # Second pass: synthesize multi-batch outputs into one final briefing.
@@ -2133,10 +2396,16 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                         )
 
             except Exception as exc:
-                error_message = f"LLM briefing generation failed: {exc}"
-                status = "degraded"
-                logger.exception(error_message)
-                content = fallback_content
+                if isinstance(exc, _SkipMainGeneration):
+                    # Intentional early-exit path when relevance filter keeps zero entries.
+                    content = fallback_content
+                    status = "success"
+                    error_message = None
+                else:
+                    error_message = f"LLM briefing generation failed: {exc}"
+                    status = "degraded"
+                    logger.exception(error_message)
+                    content = fallback_content
             finally:
                 # Ensure client is properly closed
                 if llm_client is not None:
@@ -2147,6 +2416,9 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                             logger.debug("Skip LLM client close after event loop shutdown")
                         else:
                             logger.warning("Failed to close LLM client: %s", close_exc)
+
+    # Always append filtered-out titles (if any) to the end of final briefing.
+    content = _append_filtered_titles_section(content, filtered_out_entries)
 
     # Calculate time range
     now = datetime.now(timezone.utc)
