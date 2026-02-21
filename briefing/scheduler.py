@@ -482,32 +482,23 @@ DATETIME_FORMATS = [
 LLM_CONTEXT_WINDOW_TOKENS = 32768
 LLM_DEFAULT_MAX_TOKENS = 4096
 LLM_TOKEN_SAFETY_MARGIN = 1024
-LLM_MIN_PROMPT_TOKENS = 2048
 LLM_PROMPT_CHARS_PER_TOKEN = 1
-LLM_PROMPT_CHAR_BUDGET_CAP = 60000
-LLM_PROMPT_CHAR_BUDGET_FLOOR = 12000
 LLM_PROMPT_OVERHEAD_CHARS = 6000
 
 
 def _estimate_prompt_char_budget(configured_max_tokens: int | None) -> int:
     """
-    Estimate a safe prompt character budget with an upper bound.
+    Estimate prompt character budget from context window only.
+
+    No fixed hard cap is applied here; budget is derived from
+    model context window, desired output tokens, and safety margin.
     """
     desired_output_tokens = configured_max_tokens or LLM_DEFAULT_MAX_TOKENS
-    # Keep budget planning conservative even if user configured very large outputs.
-    desired_output_tokens = min(desired_output_tokens, LLM_DEFAULT_MAX_TOKENS)
-    available_prompt_tokens = (
-        LLM_CONTEXT_WINDOW_TOKENS - desired_output_tokens - LLM_TOKEN_SAFETY_MARGIN
+    available_prompt_tokens = max(
+        0,
+        LLM_CONTEXT_WINDOW_TOKENS - desired_output_tokens - LLM_TOKEN_SAFETY_MARGIN,
     )
-    safe_prompt_tokens = max(LLM_MIN_PROMPT_TOKENS, available_prompt_tokens)
-    estimated_chars = (
-        safe_prompt_tokens * LLM_PROMPT_CHARS_PER_TOKEN - LLM_PROMPT_OVERHEAD_CHARS
-    )
-    safe_article_chars = max(0, estimated_chars)
-    return max(
-        LLM_PROMPT_CHAR_BUDGET_FLOOR,
-        min(safe_article_chars, LLM_PROMPT_CHAR_BUDGET_CAP),
-    )
+    return available_prompt_tokens * LLM_PROMPT_CHARS_PER_TOKEN
 
 
 # =============================================================================
