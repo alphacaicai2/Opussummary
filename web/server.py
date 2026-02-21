@@ -79,8 +79,11 @@ LLM_DEFAULT_MAX_TOKENS = 4096
 LLM_TOKEN_SAFETY_MARGIN = 1024
 LLM_PROMPT_CHARS_PER_TOKEN = 1
 LLM_PROMPT_OVERHEAD_CHARS = 6000
+# Segment size for "every article must be read by LLM" mode.
+# Long articles are split into multiple segments instead of being dropped.
 LLM_ARTICLE_CONTENT_CHAR_LIMIT = 2400
 MODEL_LIMIT_CACHE_TTL_SECONDS = 600
+LLM_BATCH_SYNTHESIS_ARTICLE_CONTENT_CHAR_LIMIT = 3200
 
 _MODEL_LIMIT_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _MODEL_LIMIT_CACHE_LOCK = threading.Lock()
@@ -350,6 +353,18 @@ def _resolve_effective_max_tokens(
     )
 
 
+def _is_payload_too_large_error(exc: Exception) -> bool:
+    """Detect provider-side request body too large errors (HTTP 413)."""
+    message = str(exc).lower()
+    markers = (
+        "413",
+        "payload too large",
+        "request entity too large",
+        "entity too large",
+    )
+    return any(marker in message for marker in markers)
+
+
 def _truncate_articles_for_prompt_budget(
     articles: list[dict[str, str]],
     *,
@@ -396,6 +411,151 @@ def _truncate_articles_for_prompt_budget(
     return truncated_articles, total_chars
 
 
+def _truncate_articles_per_item(
+    articles: list[dict[str, str]],
+    *,
+    max_article_content_chars: int,
+) -> tuple[list[dict[str, str]], int]:
+    """
+    Truncate each article content independently without dropping any article.
+
+    Returns:
+        (normalized_articles, total_content_chars)
+    """
+    total_chars = 0
+    normalized_articles: list[dict[str, str]] = []
+    ellipsis = "..."
+
+    for article in articles:
+        content = article.get("content", "")
+        if len(content) > max_article_content_chars:
+            keep = max_article_content_chars - len(ellipsis)
+            if keep > 0:
+                content = content[:keep] + ellipsis
+            else:
+                content = content[:max_article_content_chars]
+            article = {**article, "content": content}
+        normalized_articles.append(article)
+        total_chars += len(content)
+
+    return normalized_articles, total_chars
+
+
+def _expand_articles_for_llm_reading(
+    articles: list[dict[str, str]],
+    *,
+    max_article_content_chars: int,
+) -> tuple[list[dict[str, str]], int]:
+    """
+    Expand long articles into multiple segments so no article is dropped.
+
+    Returns:
+        (expanded_articles, total_content_chars)
+    """
+    if max_article_content_chars < 1:
+        return list(articles), sum(len(str(a.get("content", ""))) for a in articles)
+
+    expanded: list[dict[str, str]] = []
+    total_chars = 0
+
+    for article in articles:
+        content = str(article.get("content", "") or "")
+        if not content:
+            expanded.append(article)
+            continue
+
+        if len(content) <= max_article_content_chars:
+            expanded.append(article)
+            total_chars += len(content)
+            continue
+
+        parts = [
+            content[i:i + max_article_content_chars]
+            for i in range(0, len(content), max_article_content_chars)
+        ]
+        part_total = len(parts)
+        base_title = str(article.get("title", "") or "无标题")
+        for idx, part in enumerate(parts, 1):
+            seg_article = {
+                **article,
+                "title": f"{base_title} [段 {idx}/{part_total}]",
+                "content": part,
+            }
+            expanded.append(seg_article)
+            total_chars += len(part)
+
+    return expanded, total_chars
+
+
+def _split_single_article_on_content(
+    article: dict[str, str],
+) -> tuple[dict[str, str], dict[str, str]] | None:
+    """Split one article segment into two smaller segments for payload retry."""
+    content = str(article.get("content", "") or "")
+    if len(content) <= 1:
+        return None
+
+    mid = len(content) // 2
+    left_content = content[:mid]
+    right_content = content[mid:]
+    if not left_content or not right_content:
+        return None
+
+    base_title = str(article.get("title", "") or "无标题")
+    left = {**article, "title": f"{base_title} [细分 1/2]", "content": left_content}
+    right = {**article, "title": f"{base_title} [细分 2/2]", "content": right_content}
+    return left, right
+
+
+def _split_articles_by_prompt_tokens(
+    articles: list[dict[str, str]],
+    target_prompt_tokens: int,
+) -> list[list[dict[str, str]]]:
+    """
+    Split articles into multiple batches so each batch prompt fits target tokens.
+
+    The split preserves original recency order and never drops articles.
+    """
+    if not articles:
+        return []
+
+    batches: list[list[dict[str, str]]] = []
+    current: list[dict[str, str]] = []
+
+    for article in articles:
+        if not current:
+            current = [article]
+            continue
+
+        candidate = current + [article]
+        if _estimate_prompt_tokens_from_articles(candidate) <= target_prompt_tokens:
+            current = candidate
+            continue
+
+        batches.append(current)
+        current = [article]
+
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _merge_grouped_markdowns(batch_results: list[dict[str, Any]]) -> str:
+    """Fallback merge for grouped generation outputs."""
+    lines = [
+        "# OpusBrief - 分组汇总",
+        "",
+        "以下内容由多批次生成结果合并，已尽量覆盖全部入选文章。",
+        "",
+    ]
+    for idx, item in enumerate(batch_results, 1):
+        lines.append(f"## 分组 {idx}（{item.get('article_count', 0)} 篇）")
+        lines.append("")
+        lines.append(str(item.get("markdown") or "").strip())
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
 def _resolve_context_plan_for_llm(llm_row: sqlite3.Row | None) -> dict[str, Any]:
     """
     Resolve context/output plan for one LLM config.
@@ -436,13 +596,20 @@ def _resolve_context_plan_for_llm(llm_row: sqlite3.Row | None) -> dict[str, Any]
         )
         desired_output_tokens = context_planning_ceiling
 
+    # Planning output tokens are used for input grouping only.
+    # Use at most one-third of context for planned output so input budget stays healthy.
+    planning_output_tokens = min(
+        desired_output_tokens,
+        max(1, context_window_tokens // 3),
+    )
+
     prompt_char_budget = _estimate_prompt_char_budget_for_context(
         context_window_tokens,
-        desired_output_tokens,
+        planning_output_tokens,
     )
     target_prompt_tokens = _target_prompt_tokens_for_context(
         context_window_tokens,
-        desired_output_tokens,
+        planning_output_tokens,
     )
 
     return {
@@ -454,6 +621,7 @@ def _resolve_context_plan_for_llm(llm_row: sqlite3.Row | None) -> dict[str, Any]
         "model_max_output_tokens": model_max_output_tokens,
         "context_planning_ceiling": context_planning_ceiling,
         "desired_output_tokens": desired_output_tokens,
+        "planning_output_tokens": planning_output_tokens,
         "prompt_char_budget": prompt_char_budget,
         "target_prompt_tokens": target_prompt_tokens,
     }
@@ -463,11 +631,12 @@ def _build_token_preview(entries: list[dict[str, Any]], llm_row: sqlite3.Row | N
     """Build token estimate preview for current filters and model selection."""
     plan = _resolve_context_plan_for_llm(llm_row)
     articles = _prepare_articles_for_briefing(entries)
-    articles, total_content_chars = _truncate_articles_for_prompt_budget(
+    source_article_count = len(articles)
+    articles, total_content_chars = _expand_articles_for_llm_reading(
         articles,
         max_article_content_chars=LLM_ARTICLE_CONTENT_CHAR_LIMIT,
-        prompt_char_budget=plan["prompt_char_budget"],
     )
+    batches = _split_articles_by_prompt_tokens(articles, plan["target_prompt_tokens"])
 
     estimated_prompt_tokens = _estimate_prompt_tokens_from_articles(articles)
     effective_output_tokens = _resolve_effective_max_tokens_for_context(
@@ -476,14 +645,7 @@ def _build_token_preview(entries: list[dict[str, Any]], llm_row: sqlite3.Row | N
         estimated_prompt_tokens,
     )
 
-    trim_probe = list(articles)
-    trimmed_count, _ = _trim_articles_to_fit_context_window_for_context(
-        trim_probe,
-        plan["desired_output_tokens"],
-        plan["context_window_tokens"],
-    )
-
-    over_limit = estimated_prompt_tokens > plan["target_prompt_tokens"]
+    over_limit = len(batches) > 1 or estimated_prompt_tokens > plan["target_prompt_tokens"]
     usage_ratio = (
         float(estimated_prompt_tokens) / float(plan["target_prompt_tokens"])
         if plan["target_prompt_tokens"] > 0
@@ -492,9 +654,11 @@ def _build_token_preview(entries: list[dict[str, Any]], llm_row: sqlite3.Row | N
 
     return {
         **plan,
+        "source_article_count": source_article_count,
         "article_count_for_estimate": len(articles),
-        "article_count_after_trim": len(trim_probe),
-        "trimmed_count": trimmed_count,
+        "article_count_after_trim": len(articles),
+        "trimmed_count": 0,
+        "suggested_batch_count": len(batches),
         "content_chars_for_estimate": total_content_chars,
         "estimated_prompt_tokens": estimated_prompt_tokens,
         "effective_output_tokens": effective_output_tokens,
@@ -1701,28 +1865,30 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                     plan["model_limit_source"],
                 )
 
-                # Truncate article content to prevent token overflow
-                articles, total_chars = _truncate_articles_for_prompt_budget(
+                source_article_count = len(articles)
+                # Expand long articles into multiple segments so every article is read by LLM.
+                articles, total_chars = _expand_articles_for_llm_reading(
                     articles,
                     max_article_content_chars=LLM_ARTICLE_CONTENT_CHAR_LIMIT,
-                    prompt_char_budget=prompt_char_budget,
                 )
                 logger.info(
-                    "Prepared %d articles for LLM (total chars: %d, budget: %d)",
+                    "Prepared articles for grouped LLM reading: source_articles=%d, expanded_segments=%d, total_chars=%d",
+                    source_article_count,
                     len(articles),
                     total_chars,
-                    prompt_char_budget,
                 )
 
-                trimmed_count, target_prompt_tokens = _trim_articles_to_fit_context_window_for_context(
+                target_prompt_tokens = plan["target_prompt_tokens"]
+                article_batches = _split_articles_by_prompt_tokens(
                     articles,
-                    plan["desired_output_tokens"],
-                    plan["context_window_tokens"],
+                    target_prompt_tokens,
                 )
-                if trimmed_count > 0:
+                if len(article_batches) > 1:
                     logger.warning(
-                        "Trimmed %d article(s) to preserve output token budget",
-                        trimmed_count,
+                        "Grouped generation activated: total_articles=%d, batches=%d, target_prompt_tokens=%d",
+                        len(articles),
+                        len(article_batches),
+                        target_prompt_tokens,
                     )
 
                 estimated_prompt_tokens = _estimate_prompt_tokens_from_articles(articles)
@@ -1749,14 +1915,18 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                     "  Model Limit Source: %s\n"
                     "  Max Tokens (configured): %s\n"
                     "  Max Tokens (desired): %d\n"
+                    "  Max Tokens (planning): %d\n"
                     "  Max Tokens (effective): %s\n"
+                    "  Grouped Batches: %d\n"
                     "  Estimated Prompt Tokens: %d\n"
                     "  Temperature: %s",
                     plan["context_window_tokens"],
                     plan["model_limit_source"],
                     plan["configured_max_tokens"] if plan["configured_max_tokens"] is not None else "(using default)",
                     plan["desired_output_tokens"],
+                    plan["planning_output_tokens"],
                     effective_max_tokens,
+                    len(article_batches),
                     estimated_prompt_tokens,
                     llm_temperature if llm_temperature is not None else "(using default)",
                 )
@@ -1777,36 +1947,161 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                             "custom_required_sections": tuple(json.loads(custom_row["required_sections"] or "[]")),
                         }
 
-                request = BriefingGenerateRequest(
-                    template=resolved_template,
-                    articles=articles,
-                    timezone=task_timezone,
-                    time_range_hours=time_range_hours,
-                    output_format="markdown",
-                    article_content_max_length=LLM_ARTICLE_CONTENT_CHAR_LIMIT,
-                    prompt_char_budget=prompt_char_budget,
-                    max_tokens=effective_max_tokens,
-                    temperature=llm_temperature,
-                    **custom_template_kwargs,
-                )
+                # Generate each batch independently. If provider still returns 413,
+                # split that batch in half and retry until each sub-batch is accepted.
+                batch_queue: list[list[dict[str, str]]] = [list(batch) for batch in article_batches]
+                batch_results: list[dict[str, Any]] = []
 
-                # Generate briefing
-                result = generator.generate(request)
+                while batch_queue:
+                    batch_articles = batch_queue.pop(0)
+                    batch_estimated_prompt_tokens = _estimate_prompt_tokens_from_articles(batch_articles)
+                    batch_effective_max_tokens = _resolve_effective_max_tokens_for_context(
+                        plan["context_window_tokens"],
+                        plan["desired_output_tokens"],
+                        batch_estimated_prompt_tokens,
+                    )
 
-                # Validate result
-                if result.markdown and result.markdown.strip():
-                    content = result.markdown
+                    batch_request = BriefingGenerateRequest(
+                        template=resolved_template,
+                        articles=batch_articles,
+                        timezone=task_timezone,
+                        time_range_hours=time_range_hours,
+                        output_format="markdown",
+                        article_content_max_length=LLM_ARTICLE_CONTENT_CHAR_LIMIT,
+                        prompt_char_budget=prompt_char_budget,
+                        max_tokens=batch_effective_max_tokens,
+                        temperature=llm_temperature,
+                        **custom_template_kwargs,
+                    )
+
+                    try:
+                        batch_result = generator.generate(batch_request)
+                        batch_markdown = (batch_result.markdown or "").strip()
+                        if not batch_markdown:
+                            raise ValueError("LLM returned empty content for grouped batch")
+
+                        batch_results.append(
+                            {
+                                "markdown": batch_markdown,
+                                "article_count": len(batch_articles),
+                                "estimated_prompt_tokens": batch_estimated_prompt_tokens,
+                            }
+                        )
+                        logger.info(
+                            "LLM batch generated successfully: batch_index=%d, articles=%d, estimated_prompt_tokens=%d",
+                            len(batch_results),
+                            len(batch_articles),
+                            batch_estimated_prompt_tokens,
+                        )
+                    except Exception as gen_exc:
+                        if _is_payload_too_large_error(gen_exc):
+                            if len(batch_articles) > 1:
+                                mid = len(batch_articles) // 2
+                                left = batch_articles[:mid]
+                                right = batch_articles[mid:]
+                                batch_queue = [left, right] + batch_queue
+                                logger.warning(
+                                    "Batch payload too large; split and retry: old=%d, left=%d, right=%d",
+                                    len(batch_articles),
+                                    len(left),
+                                    len(right),
+                                )
+                                continue
+
+                            split_single = _split_single_article_on_content(batch_articles[0])
+                            if split_single is not None:
+                                left, right = split_single
+                                batch_queue = [[left], [right]] + batch_queue
+                                logger.warning(
+                                    "Single-article batch too large; split article content and retry"
+                                )
+                                continue
+                        raise
+
+                if not batch_results:
+                    raise ValueError("Grouped generation returned no batch results")
+
+                # Single batch can be returned directly.
+                if len(batch_results) == 1:
+                    content = batch_results[0]["markdown"]
                     used_llm = True
                     logger.info(
-                        "LLM briefing generated successfully: template=%s, articles=%d (of %d)",
+                        "LLM briefing generated successfully: template=%s, articles=%d (of %d), batches=1",
                         resolved_template.value,
-                        len(articles),
+                        batch_results[0]["article_count"],
                         len(entries),
                     )
                 else:
-                    error_message = "LLM returned empty content, using simple list format"
-                    status = "degraded"
-                    logger.warning(error_message)
+                    # Second pass: synthesize multi-batch outputs into one final briefing.
+                    synthesis_articles: list[dict[str, str]] = []
+                    synthesis_now_iso = _utcnow_iso()
+                    ellipsis = "..."
+                    for idx, item in enumerate(batch_results, 1):
+                        chunk_text = str(item["markdown"])
+                        if len(chunk_text) > LLM_BATCH_SYNTHESIS_ARTICLE_CONTENT_CHAR_LIMIT:
+                            keep = LLM_BATCH_SYNTHESIS_ARTICLE_CONTENT_CHAR_LIMIT - len(ellipsis)
+                            chunk_text = (
+                                chunk_text[:keep] + ellipsis
+                                if keep > 0
+                                else chunk_text[:LLM_BATCH_SYNTHESIS_ARTICLE_CONTENT_CHAR_LIMIT]
+                            )
+                        synthesis_articles.append(
+                            {
+                                "title": f"分组摘要 {idx}（{item['article_count']} 篇）",
+                                "url": "",
+                                "published_at": synthesis_now_iso,
+                                "source": f"batch-{idx}",
+                                "content": chunk_text,
+                                "category": "batch_summary",
+                            }
+                        )
+
+                    synthesis_batches = _split_articles_by_prompt_tokens(
+                        synthesis_articles,
+                        target_prompt_tokens,
+                    )
+                    if len(synthesis_batches) == 1:
+                        synthesis_estimated_prompt_tokens = _estimate_prompt_tokens_from_articles(
+                            synthesis_articles
+                        )
+                        synthesis_effective_max_tokens = _resolve_effective_max_tokens_for_context(
+                            plan["context_window_tokens"],
+                            plan["desired_output_tokens"],
+                            synthesis_estimated_prompt_tokens,
+                        )
+                        synthesis_request = BriefingGenerateRequest(
+                            template=resolved_template,
+                            articles=synthesis_articles,
+                            timezone=task_timezone,
+                            time_range_hours=time_range_hours,
+                            output_format="markdown",
+                            article_content_max_length=LLM_BATCH_SYNTHESIS_ARTICLE_CONTENT_CHAR_LIMIT,
+                            prompt_char_budget=prompt_char_budget,
+                            max_tokens=synthesis_effective_max_tokens,
+                            temperature=llm_temperature,
+                            **custom_template_kwargs,
+                        )
+                        synthesis_result = generator.generate(synthesis_request)
+                        synthesis_markdown = (synthesis_result.markdown or "").strip()
+                        if synthesis_markdown:
+                            content = synthesis_markdown
+                            used_llm = True
+                            logger.info(
+                                "Grouped synthesis succeeded: template=%s, source_batches=%d",
+                                resolved_template.value,
+                                len(batch_results),
+                            )
+                        else:
+                            content = _merge_grouped_markdowns(batch_results)
+                            used_llm = True
+                            logger.warning("Grouped synthesis returned empty content; fallback to merged batch markdown")
+                    else:
+                        content = _merge_grouped_markdowns(batch_results)
+                        used_llm = True
+                        logger.warning(
+                            "Grouped synthesis skipped because batch summaries still exceed prompt budget: synthesis_batches=%d",
+                            len(synthesis_batches),
+                        )
 
             except Exception as exc:
                 error_message = f"LLM briefing generation failed: {exc}"
@@ -1819,7 +2114,10 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                     try:
                         llm_client.close()
                     except Exception as close_exc:
-                        logger.warning("Failed to close LLM client: %s", close_exc)
+                        if "Event loop is closed" in str(close_exc):
+                            logger.debug("Skip LLM client close after event loop shutdown")
+                        else:
+                            logger.warning("Failed to close LLM client: %s", close_exc)
 
     # Calculate time range
     now = datetime.now(timezone.utc)

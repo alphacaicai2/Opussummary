@@ -66,6 +66,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger("opus.briefing.generator")
 
 
+def _is_payload_too_large_error(exc: Exception) -> bool:
+    """Detect provider-side request body too large errors (HTTP 413)."""
+    message = str(exc).lower()
+    markers = (
+        "413",
+        "payload too large",
+        "request entity too large",
+        "entity too large",
+    )
+    return any(marker in message for marker in markers)
+
+
 # =============================================================================
 # Exceptions
 # =============================================================================
@@ -705,6 +717,13 @@ class BriefingGenerator:
                     self._max_retries + 1,
                     exc,
                 )
+                # Request-body-too-large errors are not retryable with identical input.
+                if _is_payload_too_large_error(exc):
+                    raise LLMSyntaxError(
+                        f"简报生成失败（请求体过大）: {last_error}",
+                        template_id=template.template_id.value,
+                        attempt_count=attempt + 1,
+                    ) from exc
 
         # All retries exhausted
         raise LLMSyntaxError(

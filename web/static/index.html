@@ -1239,17 +1239,24 @@
                 const usagePercent = Math.max(0, Math.round(usageRatio * 100));
                 const modelName = tokenPreview.model_name || '默认模型';
                 const desiredOutput = tokenPreview.desired_output_tokens || 0;
+                const planningOutput = tokenPreview.planning_output_tokens || desiredOutput;
                 const effectiveOutput = tokenPreview.effective_output_tokens || 0;
                 const trimmedCount = tokenPreview.trimmed_count || 0;
+                const suggestedBatchCount = tokenPreview.suggested_batch_count || 1;
                 const modelLimitSource = tokenPreview.model_limit_source === 'provider_models' ? '模型接口' : '本地回退';
 
                 let riskClass = 'text-green-400';
                 let riskText = 'Token 预算充足';
                 if (tokenPreview.over_limit || trimmedCount > 0) {
-                    riskClass = 'text-red-400';
-                    riskText = trimmedCount > 0
-                        ? `超预算风险，预计需裁剪 ${trimmedCount} 篇`
-                        : '超预算风险，当前内容已接近最小输入规模';
+                    if (suggestedBatchCount > 1) {
+                        riskClass = 'text-yellow-400';
+                        riskText = `单次请求可能超限，预计分 ${suggestedBatchCount} 组生成`;
+                    } else {
+                        riskClass = 'text-red-400';
+                        riskText = trimmedCount > 0
+                            ? `超预算风险，预计需裁剪 ${trimmedCount} 篇`
+                            : '超预算风险，当前内容已接近最小输入规模';
+                    }
                 } else if (usageRatio >= 0.85) {
                     riskClass = 'text-yellow-400';
                     riskText = '接近预算上限，建议缩短时间范围或减少分组';
@@ -1258,7 +1265,7 @@
                 tokenEl.innerHTML = `
                     <div class="text-gray-400">模型: ${escapeHtml(String(modelName))} | 上下文: <span class="text-gray-300">${contextWindow}</span> tokens (${modelLimitSource})</div>
                     <div class="text-gray-400">预计输入: <span class="text-gray-300">${estimatedPrompt}</span> / <span class="text-gray-300">${targetPrompt}</span> tokens (${usagePercent}%)</div>
-                    <div class="text-gray-400">输出预算: <span class="text-gray-300">${effectiveOutput}</span> / ${desiredOutput} tokens</div>
+                    <div class="text-gray-400">输出预算: <span class="text-gray-300">${effectiveOutput}</span> / ${desiredOutput} tokens（规划按 ${planningOutput} 计算）</div>
                     <div class="${riskClass}">${riskText}</div>
                 `;
             } catch (error) {
