@@ -250,7 +250,7 @@ def _resolve_llm_config_for_task(llm_config_id: int | None) -> dict[str, Any] | 
             if llm_config_id is not None:
                 row = conn.execute(
                     """
-                    SELECT id, provider, base_url, api_key, model
+                    SELECT *
                     FROM llm_configs
                     WHERE id = ?
                     """,
@@ -263,6 +263,8 @@ def _resolve_llm_config_for_task(llm_config_id: int | None) -> dict[str, Any] | 
                         "base_url": row["base_url"],
                         "api_key": row["api_key"],
                         "model": row["model"],
+                        "max_tokens": row["max_tokens"] if "max_tokens" in row.keys() else None,
+                        "temperature": row["temperature"] if "temperature" in row.keys() else None,
                     }
                 logger.warning(
                     "LLM config %d not found, falling back to default",
@@ -272,7 +274,7 @@ def _resolve_llm_config_for_task(llm_config_id: int | None) -> dict[str, Any] | 
             # Try default config
             row = conn.execute(
                 """
-                SELECT id, provider, base_url, api_key, model
+                SELECT *
                 FROM llm_configs
                 WHERE is_default = 1
                 LIMIT 1
@@ -285,12 +287,14 @@ def _resolve_llm_config_for_task(llm_config_id: int | None) -> dict[str, Any] | 
                     "base_url": row["base_url"],
                     "api_key": row["api_key"],
                     "model": row["model"],
+                    "max_tokens": row["max_tokens"] if "max_tokens" in row.keys() else None,
+                    "temperature": row["temperature"] if "temperature" in row.keys() else None,
                 }
 
             # Fall back to first available config
             row = conn.execute(
                 """
-                SELECT id, provider, base_url, api_key, model
+                SELECT *
                 FROM llm_configs
                 ORDER BY id
                 LIMIT 1
@@ -303,6 +307,8 @@ def _resolve_llm_config_for_task(llm_config_id: int | None) -> dict[str, Any] | 
                     "base_url": row["base_url"],
                     "api_key": row["api_key"],
                     "model": row["model"],
+                    "max_tokens": row["max_tokens"] if "max_tokens" in row.keys() else None,
+                    "temperature": row["temperature"] if "temperature" in row.keys() else None,
                 }
 
             logger.warning("No LLM configuration found in database")
@@ -471,6 +477,37 @@ DATETIME_FORMATS = [
     "%Y-%m-%dT%H:%M:%S",
     "%Y-%m-%dT%H:%M",
 ]
+
+# Conservative defaults for OpenAI-compatible models (including SiliconFlow)
+LLM_CONTEXT_WINDOW_TOKENS = 32768
+LLM_DEFAULT_MAX_TOKENS = 4096
+LLM_TOKEN_SAFETY_MARGIN = 1024
+LLM_MIN_PROMPT_TOKENS = 2048
+LLM_PROMPT_CHARS_PER_TOKEN = 1
+LLM_PROMPT_CHAR_BUDGET_CAP = 60000
+LLM_PROMPT_CHAR_BUDGET_FLOOR = 12000
+LLM_PROMPT_OVERHEAD_CHARS = 6000
+
+
+def _estimate_prompt_char_budget(configured_max_tokens: int | None) -> int:
+    """
+    Estimate a safe prompt character budget with an upper bound.
+    """
+    desired_output_tokens = configured_max_tokens or LLM_DEFAULT_MAX_TOKENS
+    # Keep budget planning conservative even if user configured very large outputs.
+    desired_output_tokens = min(desired_output_tokens, LLM_DEFAULT_MAX_TOKENS)
+    available_prompt_tokens = (
+        LLM_CONTEXT_WINDOW_TOKENS - desired_output_tokens - LLM_TOKEN_SAFETY_MARGIN
+    )
+    safe_prompt_tokens = max(LLM_MIN_PROMPT_TOKENS, available_prompt_tokens)
+    estimated_chars = (
+        safe_prompt_tokens * LLM_PROMPT_CHARS_PER_TOKEN - LLM_PROMPT_OVERHEAD_CHARS
+    )
+    safe_article_chars = max(0, estimated_chars)
+    return max(
+        LLM_PROMPT_CHAR_BUDGET_FLOOR,
+        min(safe_article_chars, LLM_PROMPT_CHAR_BUDGET_CAP),
+    )
 
 
 # =============================================================================
@@ -966,17 +1003,26 @@ class BriefingScheduler:
             logger.info("Task %s: no articles to process, returning empty content", task.id)
             return "# OpusBrief\n\n暂无符合条件的文章。\n"
 
-        # Step 4: Create generator with LLM client
+        # Step 4: Resolve LLM config for generation parameters
+        llm_config = _resolve_llm_config_for_task(getattr(task, "llm_config_id", None))
+        if llm_config is None:
+            raise TaskExecutionError(
+                f"No LLM configuration available for task {getattr(task, 'id', 'unknown')}"
+            )
+        llm_max_tokens = llm_config.get("max_tokens")
+        llm_temperature = llm_config.get("temperature")
+
+        # Step 5: Create generator with LLM client
         generator = self._get_generator(task)
 
-        # Step 5: Create BriefingGenerateRequest and generate
-        # Dynamic budget: entries * 30000 chars per entry
-        prompt_char_budget = len(entries) * 30000
+        # Step 6: Create BriefingGenerateRequest and generate
+        prompt_char_budget = _estimate_prompt_char_budget(llm_max_tokens)
         logger.info(
-            "Task %s: dynamic prompt_char_budget = %d entries * 30000 = %d chars",
+            "Task %s: prompt_char_budget=%d (entries=%d, configured_max_tokens=%s)",
             task.id,
-            len(entries),
             prompt_char_budget,
+            len(entries),
+            llm_max_tokens if llm_max_tokens is not None else "(default)",
         )
 
         try:
@@ -1010,6 +1056,8 @@ class BriefingScheduler:
                 time_range_hours=time_range_hours,
                 output_format="markdown",
                 prompt_char_budget=prompt_char_budget,
+                max_tokens=llm_max_tokens,
+                temperature=llm_temperature,
                 **custom_kwargs,
             )
 

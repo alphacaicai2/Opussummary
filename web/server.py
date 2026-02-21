@@ -71,6 +71,70 @@ BRIEFING_TEMPLATES = {
     "wechat_mp": {"name": "公众号格式", "description": "创作灵感，焦虑点/共鸣点/争议点/爆款潜力"},
 }
 
+# Conservative defaults for OpenAI-compatible models (including SiliconFlow)
+LLM_CONTEXT_WINDOW_TOKENS = 32768
+LLM_DEFAULT_MAX_TOKENS = 4096
+LLM_TOKEN_SAFETY_MARGIN = 1024
+LLM_MIN_PROMPT_TOKENS = 2048
+LLM_PROMPT_CHARS_PER_TOKEN = 1
+LLM_PROMPT_CHAR_BUDGET_CAP = 60000
+LLM_PROMPT_CHAR_BUDGET_FLOOR = 12000
+LLM_PROMPT_OVERHEAD_CHARS = 6000
+
+
+def _estimate_prompt_char_budget(configured_max_tokens: int | None) -> int:
+    """
+    Estimate a safe prompt character budget with an upper bound.
+
+    This prevents extremely large prompts from exhausting model context.
+    """
+    desired_output_tokens = configured_max_tokens or LLM_DEFAULT_MAX_TOKENS
+    # Keep budget planning conservative even if user configured very large outputs.
+    desired_output_tokens = min(desired_output_tokens, LLM_DEFAULT_MAX_TOKENS)
+    available_prompt_tokens = (
+        LLM_CONTEXT_WINDOW_TOKENS - desired_output_tokens - LLM_TOKEN_SAFETY_MARGIN
+    )
+    safe_prompt_tokens = max(LLM_MIN_PROMPT_TOKENS, available_prompt_tokens)
+    estimated_chars = (
+        safe_prompt_tokens * LLM_PROMPT_CHARS_PER_TOKEN - LLM_PROMPT_OVERHEAD_CHARS
+    )
+    safe_article_chars = max(0, estimated_chars)
+    return max(
+        LLM_PROMPT_CHAR_BUDGET_FLOOR,
+        min(safe_article_chars, LLM_PROMPT_CHAR_BUDGET_CAP),
+    )
+
+
+def _estimate_prompt_tokens_from_articles(articles: list[dict[str, str]]) -> int:
+    """
+    Rough token estimate from serialized articles plus fixed prompt overhead.
+    """
+    payload_chars = len(
+        json.dumps(articles, ensure_ascii=False, separators=(",", ":"))
+    )
+    prompt_chars = payload_chars + LLM_PROMPT_OVERHEAD_CHARS
+    # ceil(chars / chars_per_token)
+    return max(
+        1,
+        (prompt_chars + LLM_PROMPT_CHARS_PER_TOKEN - 1) // LLM_PROMPT_CHARS_PER_TOKEN,
+    )
+
+
+def _resolve_effective_max_tokens(
+    configured_max_tokens: int | None,
+    estimated_prompt_tokens: int,
+) -> int:
+    """
+    Clamp output tokens to fit within context window after prompt tokens.
+    """
+    configured = configured_max_tokens or LLM_DEFAULT_MAX_TOKENS
+    available_output = (
+        LLM_CONTEXT_WINDOW_TOKENS - estimated_prompt_tokens - LLM_TOKEN_SAFETY_MARGIN
+    )
+    # Keep a small floor to avoid zero/negative output budget.
+    safe_available_output = max(256, available_output)
+    return max(1, min(configured, safe_available_output))
+
 
 # =============================================================================
 # Utility Functions
@@ -946,7 +1010,7 @@ def _resolve_llm_config(
         if llm_config_id is not None:
             row = conn.execute(
                 """
-                SELECT id, name, provider, base_url, api_key, model, max_tokens, temperature
+                SELECT *
                 FROM llm_configs
                 WHERE id = ?
                 """,
@@ -969,7 +1033,7 @@ def _resolve_llm_config(
         # Try to get default config
         row = conn.execute(
             """
-            SELECT id, name, provider, base_url, api_key, model, max_tokens, temperature
+            SELECT *
             FROM llm_configs
             WHERE is_default = 1
             ORDER BY id DESC
@@ -983,7 +1047,7 @@ def _resolve_llm_config(
         # Fallback: get first available config
         return conn.execute(
             """
-            SELECT id, name, provider, base_url, api_key, model, max_tokens, temperature
+            SELECT *
             FROM llm_configs
             ORDER BY id ASC
             LIMIT 1
@@ -1250,13 +1314,16 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                 # Articles are already sorted by recency in _collect_entries
                 articles = _prepare_articles_for_briefing(entries)
 
-                # Dynamic budget: entries * 25000 chars per entry
-                # Note: Qwen2.5-72B-Instruct has 32K token limit.
-                # Using 25000 chars/entry gives safe margin (roughly 1 token ≈ 2-3 chars for mixed content)
-                prompt_char_budget = len(entries) * 25000
+                # Extract optional generation knobs from LLM config.
+                llm_max_tokens = llm_row["max_tokens"] if "max_tokens" in llm_row.keys() else None
+                llm_temperature = llm_row["temperature"] if "temperature" in llm_row.keys() else None
+
+                # Build a bounded prompt budget instead of unbounded per-entry expansion.
+                prompt_char_budget = _estimate_prompt_char_budget(llm_max_tokens)
                 logger.info(
-                    "Dynamic prompt_char_budget = %d entries * 25000 = %d chars",
+                    "Prompt budget planning: entries=%d, configured_max_tokens=%s, prompt_char_budget=%d",
                     len(entries),
+                    llm_max_tokens if llm_max_tokens is not None else "(default)",
                     prompt_char_budget,
                 )
 
@@ -1302,19 +1369,31 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                     prompt_char_budget,
                 )
 
+                estimated_prompt_tokens = _estimate_prompt_tokens_from_articles(articles)
+                effective_max_tokens = _resolve_effective_max_tokens(
+                    llm_max_tokens,
+                    estimated_prompt_tokens,
+                )
+                if llm_max_tokens is not None and effective_max_tokens < llm_max_tokens:
+                    logger.warning(
+                        "Configured max_tokens=%d exceeds safe limit for current prompt; clamped to %d",
+                        llm_max_tokens,
+                        effective_max_tokens,
+                    )
+
                 # Create briefing generator and request
                 generator = BriefingGenerator(llm_client=llm_client)
-
-                # Extract optional temperature and max_tokens from LLM config
-                llm_max_tokens = llm_row["max_tokens"] if "max_tokens" in llm_row.keys() else None
-                llm_temperature = llm_row["temperature"] if "temperature" in llm_row.keys() else None
 
                 # Log LLM generation parameters
                 logger.info(
                     "=== LLM Generation Parameters ===\n"
-                    "  Max Tokens: %s\n"
+                    "  Max Tokens (configured): %s\n"
+                    "  Max Tokens (effective): %s\n"
+                    "  Estimated Prompt Tokens: %d\n"
                     "  Temperature: %s",
-                    llm_max_tokens if llm_max_tokens else "(using default)",
+                    llm_max_tokens if llm_max_tokens is not None else "(using default)",
+                    effective_max_tokens,
+                    estimated_prompt_tokens,
                     llm_temperature if llm_temperature is not None else "(using default)",
                 )
 
@@ -1341,8 +1420,8 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                     time_range_hours=time_range_hours,
                     output_format="markdown",
                     article_content_max_length=MAX_ARTICLE_CONTENT_CHARS,  # Pass limit to generator
-                    prompt_char_budget=prompt_char_budget,  # Dynamic budget
-                    max_tokens=llm_max_tokens,
+                    prompt_char_budget=prompt_char_budget,
+                    max_tokens=effective_max_tokens,
                     temperature=llm_temperature,
                     **custom_template_kwargs,
                 )
