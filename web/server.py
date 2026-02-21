@@ -109,6 +109,37 @@ def _estimate_prompt_tokens_from_articles(articles: list[dict[str, str]]) -> int
     )
 
 
+def _target_prompt_tokens(desired_output_tokens: int) -> int:
+    """Compute prompt token budget from context window and desired output."""
+    return max(
+        1,
+        LLM_CONTEXT_WINDOW_TOKENS - desired_output_tokens - LLM_TOKEN_SAFETY_MARGIN,
+    )
+
+
+def _trim_articles_to_fit_context_window(
+    articles: list[dict[str, str]],
+    desired_output_tokens: int,
+) -> tuple[int, int]:
+    """
+    Trim tail articles until estimated prompt tokens fit target budget.
+
+    Returns:
+        (trimmed_count, target_prompt_tokens)
+    """
+    target_prompt_tokens = _target_prompt_tokens(desired_output_tokens)
+    trimmed_count = 0
+
+    while len(articles) > 1:
+        estimated_prompt_tokens = _estimate_prompt_tokens_from_articles(articles)
+        if estimated_prompt_tokens <= target_prompt_tokens:
+            break
+        articles.pop()
+        trimmed_count += 1
+
+    return trimmed_count, target_prompt_tokens
+
+
 def _resolve_effective_max_tokens(
     configured_max_tokens: int | None,
     estimated_prompt_tokens: int,
@@ -1357,15 +1388,27 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                     prompt_char_budget,
                 )
 
+                desired_output_tokens = llm_max_tokens or LLM_DEFAULT_MAX_TOKENS
+                trimmed_count, target_prompt_tokens = _trim_articles_to_fit_context_window(
+                    articles,
+                    desired_output_tokens,
+                )
+                if trimmed_count > 0:
+                    logger.warning(
+                        "Trimmed %d article(s) to preserve output token budget",
+                        trimmed_count,
+                    )
+
                 estimated_prompt_tokens = _estimate_prompt_tokens_from_articles(articles)
                 effective_max_tokens = _resolve_effective_max_tokens(
-                    llm_max_tokens,
+                    desired_output_tokens,
                     estimated_prompt_tokens,
                 )
-                if llm_max_tokens is not None and effective_max_tokens < llm_max_tokens:
+                if effective_max_tokens < desired_output_tokens:
                     logger.warning(
-                        "Configured max_tokens=%d exceeds safe limit for current prompt; clamped to %d",
-                        llm_max_tokens,
+                        "Prompt is still near context limit (target_prompt_tokens=%d, estimated=%d); max_tokens reduced to %d",
+                        target_prompt_tokens,
+                        estimated_prompt_tokens,
                         effective_max_tokens,
                     )
 

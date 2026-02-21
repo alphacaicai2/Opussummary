@@ -197,6 +197,7 @@
                                 <select id="gen-template" class="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-primary">
                                     <!-- 从模板列表动态加载 -->
                                 </select>
+                                <div id="gen-template-sections-hint" class="mt-2 text-xs text-gray-500"></div>
                             </div>
                             <div>
                                 <label class="block text-sm text-gray-400 mb-2">选择分组</label>
@@ -399,6 +400,7 @@
                         <select id="task-template" class="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-primary">
                             <!-- 从模板列表动态加载 -->
                         </select>
+                        <div id="task-template-sections-hint" class="mt-2 text-xs text-gray-500"></div>
                     </div>
                     <div>
                         <label class="block text-sm text-gray-400 mb-1">文章时间范围</label>
@@ -533,9 +535,10 @@
                         <p class="text-xs text-gray-500 mt-1">可用占位符: {articles_json}, {now_iso}, {timezone}, {time_range_hours}, {exchange_rate_context}, {article_count}</p>
                     </div>
                     <div>
-                        <label class="block text-sm text-gray-400 mb-1">必须包含的章节（每行一个）</label>
+                        <label class="block text-sm text-gray-400 mb-1">建议章节（每行一个，可为空）</label>
                         <textarea id="template-sections" rows="3" placeholder="# 标题&#10;## 第一节&#10;## 第二节"
                             class="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-primary font-mono"></textarea>
+                        <p class="text-xs text-gray-500 mt-1">这些章节仅作为输出提示，不是强制校验条件。</p>
                     </div>
                 </div>
             </div>
@@ -1088,12 +1091,19 @@
                 document.getElementById('task-modal-title').textContent = '新建任务';
                 document.getElementById('task-id').value = '';
                 document.getElementById('task-name').value = '';
+                if (state.templates.length > 0) {
+                    document.getElementById('task-template').value = state.templates[0].id;
+                }
                 document.getElementById('task-schedule').value = 'manual';
                 document.getElementById('task-frequency').value = 'daily';
                 document.getElementById('task-schedule-time').value = '09:00';
             }
 
             toggleScheduleTimeField();
+            renderTemplateSectionsHint(
+                'task-template-sections-hint',
+                document.getElementById('task-template').value,
+            );
 
             // Trigger preview count after categories are loaded and set
             setTimeout(() => previewEntryCount(), 150);
@@ -1522,6 +1532,7 @@
             const task = state.tasks.find(t => t.id === taskId);
             if (task) {
                 document.getElementById('gen-template').value = task.template;
+                renderTemplateSectionsHint('gen-template-sections-hint', task.template);
                 document.getElementById('gen-time-range').value = task.time_range_hours;
 
                 // Set categories
@@ -1534,6 +1545,14 @@
                     cb.checked = task.webhook_ids.includes(parseInt(cb.value));
                 });
             }
+        });
+
+        document.getElementById('task-template').addEventListener('change', function() {
+            renderTemplateSectionsHint('task-template-sections-hint', this.value);
+        });
+
+        document.getElementById('gen-template').addEventListener('change', function() {
+            renderTemplateSectionsHint('gen-template-sections-hint', this.value);
         });
 
         // History Functions
@@ -1679,6 +1698,35 @@
             }
         }
 
+        function getTemplateById(templateId) {
+            return state.templates.find(t => t.id === templateId) || null;
+        }
+
+        function renderTemplateSectionsHint(hintId, templateId) {
+            const hint = document.getElementById(hintId);
+            if (!hint) return;
+
+            const tpl = getTemplateById(templateId);
+            if (!tpl) {
+                hint.innerHTML = '';
+                return;
+            }
+
+            const sections = Array.isArray(tpl.required_sections) ? tpl.required_sections : [];
+            if (sections.length === 0) {
+                hint.innerHTML = '建议章节：无（该模板未配置建议章节）';
+                return;
+            }
+
+            const chips = sections
+                .map(s => `<span class="inline-block mr-1 mb-1 px-2 py-0.5 rounded bg-gray-700 text-gray-300">${escapeHtml(s)}</span>`)
+                .join('');
+            hint.innerHTML = `
+                <div class="text-gray-400 mb-1">建议章节（仅提示，不强制）：</div>
+                <div>${chips}</div>
+            `;
+        }
+
         // 动态更新所有模板下拉菜单
         function updateTemplateSelects() {
             const selects = ['task-template', 'gen-template'];
@@ -1693,6 +1741,11 @@
                     select.value = currentValue;
                 }
             });
+
+            const taskTemplate = document.getElementById('task-template').value;
+            const genTemplate = document.getElementById('gen-template').value;
+            renderTemplateSectionsHint('task-template-sections-hint', taskTemplate);
+            renderTemplateSectionsHint('gen-template-sections-hint', genTemplate);
         }
 
         function renderTemplateList() {
@@ -1721,6 +1774,15 @@
                         </div>
                     </div>
                     <p class="text-sm text-gray-400 line-clamp-2">${escapeHtml(t.description || '暂无描述')}</p>
+                    <div class="mt-3">
+                        <p class="text-xs text-gray-500 mb-1">建议章节（仅提示，不强制）</p>
+                        <div>
+                            ${(Array.isArray(t.required_sections) && t.required_sections.length > 0)
+                                ? t.required_sections.map(s => `<span class="inline-block mr-1 mb-1 px-2 py-0.5 rounded bg-gray-700 text-gray-300 text-xs">${escapeHtml(s)}</span>`).join('')
+                                : '<span class="text-xs text-gray-500">未配置</span>'
+                            }
+                        </div>
+                    </div>
                     <div class="mt-3 pt-3 border-t border-gray-700">
                         <details class="text-xs">
                             <summary class="text-gray-500 cursor-pointer hover:text-gray-400">查看提示词</summary>

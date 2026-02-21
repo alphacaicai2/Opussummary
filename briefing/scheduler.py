@@ -501,6 +501,66 @@ def _estimate_prompt_char_budget(configured_max_tokens: int | None) -> int:
     return available_prompt_tokens * LLM_PROMPT_CHARS_PER_TOKEN
 
 
+def _estimate_prompt_tokens_from_articles(articles: list[dict[str, str]]) -> int:
+    """
+    Rough token estimate from serialized articles plus fixed prompt overhead.
+    """
+    payload_chars = len(
+        json.dumps(articles, ensure_ascii=False, separators=(",", ":"))
+    )
+    prompt_chars = payload_chars + LLM_PROMPT_OVERHEAD_CHARS
+    return max(
+        1,
+        (prompt_chars + LLM_PROMPT_CHARS_PER_TOKEN - 1) // LLM_PROMPT_CHARS_PER_TOKEN,
+    )
+
+
+def _target_prompt_tokens(desired_output_tokens: int) -> int:
+    """Compute prompt token budget from context window and desired output."""
+    return max(
+        1,
+        LLM_CONTEXT_WINDOW_TOKENS - desired_output_tokens - LLM_TOKEN_SAFETY_MARGIN,
+    )
+
+
+def _trim_articles_to_fit_context_window(
+    articles: list[dict[str, str]],
+    desired_output_tokens: int,
+) -> tuple[int, int]:
+    """
+    Trim tail articles until estimated prompt tokens fit target budget.
+
+    Returns:
+        (trimmed_count, target_prompt_tokens)
+    """
+    target_prompt_tokens = _target_prompt_tokens(desired_output_tokens)
+    trimmed_count = 0
+
+    while len(articles) > 1:
+        estimated_prompt_tokens = _estimate_prompt_tokens_from_articles(articles)
+        if estimated_prompt_tokens <= target_prompt_tokens:
+            break
+        articles.pop()
+        trimmed_count += 1
+
+    return trimmed_count, target_prompt_tokens
+
+
+def _resolve_effective_max_tokens(
+    configured_max_tokens: int | None,
+    estimated_prompt_tokens: int,
+) -> int:
+    """
+    Clamp output tokens to fit within context window after prompt tokens.
+    """
+    configured = configured_max_tokens or LLM_DEFAULT_MAX_TOKENS
+    available_output = (
+        LLM_CONTEXT_WINDOW_TOKENS - estimated_prompt_tokens - LLM_TOKEN_SAFETY_MARGIN
+    )
+    safe_available_output = max(1, available_output)
+    return min(configured, safe_available_output)
+
+
 # =============================================================================
 # Exceptions
 # =============================================================================
@@ -1016,6 +1076,32 @@ class BriefingScheduler:
             llm_max_tokens if llm_max_tokens is not None else "(default)",
         )
 
+        desired_output_tokens = llm_max_tokens or LLM_DEFAULT_MAX_TOKENS
+        trimmed_count, target_prompt_tokens = _trim_articles_to_fit_context_window(
+            articles,
+            desired_output_tokens,
+        )
+        if trimmed_count > 0:
+            logger.warning(
+                "Task %s: trimmed %d article(s) to preserve output token budget",
+                task.id,
+                trimmed_count,
+            )
+
+        estimated_prompt_tokens = _estimate_prompt_tokens_from_articles(articles)
+        effective_max_tokens = _resolve_effective_max_tokens(
+            desired_output_tokens,
+            estimated_prompt_tokens,
+        )
+        if effective_max_tokens < desired_output_tokens:
+            logger.warning(
+                "Task %s: prompt near context limit (target_prompt_tokens=%d, estimated=%d); max_tokens reduced to %d",
+                task.id,
+                target_prompt_tokens,
+                estimated_prompt_tokens,
+                effective_max_tokens,
+            )
+
         try:
             from briefing.generator import BriefingGenerateRequest, BriefingTemplate
 
@@ -1047,7 +1133,7 @@ class BriefingScheduler:
                 time_range_hours=time_range_hours,
                 output_format="markdown",
                 prompt_char_budget=prompt_char_budget,
-                max_tokens=llm_max_tokens,
+                max_tokens=effective_max_tokens,
                 temperature=llm_temperature,
                 **custom_kwargs,
             )

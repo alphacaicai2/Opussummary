@@ -659,7 +659,7 @@ class BriefingGenerator:
         temperature: float,
         max_tokens: int,
     ) -> str:
-        """Generate markdown with retry logic for structure validation."""
+        """Generate markdown with retry logic for API/empty-response failures."""
         current_prompt = user_prompt
         last_error = "未知错误"
 
@@ -681,8 +681,8 @@ class BriefingGenerator:
                     )
                     continue
 
-                # Validate required sections using line-start regex for precision
-                # Note: Validation is now warn-only to allow flexible prompt design
+                # Validate suggested sections using line-start regex for precision.
+                # This is warn-only and does not block generation.
                 missing_sections = [
                     section
                     for section in template.required_sections
@@ -691,11 +691,10 @@ class BriefingGenerator:
 
                 if missing_sections:
                     logger.warning(
-                        "简报结构不完整 (仅警告，不重试): missing=%s",
+                        "简报结构提示（仅提示，不影响结果）: missing=%s",
                         missing_sections,
                     )
 
-                # Return output regardless of validation result
                 return output
 
             except Exception as exc:
