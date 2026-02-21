@@ -425,6 +425,16 @@ def _resolve_context_plan_for_llm(llm_row: sqlite3.Row | None) -> dict[str, Any]
     desired_output_tokens = configured_max_tokens or LLM_DEFAULT_MAX_TOKENS
     if model_max_output_tokens is not None:
         desired_output_tokens = min(desired_output_tokens, model_max_output_tokens)
+    # Keep planning budget sane even when configured max_tokens is very large.
+    # This is context-derived (not a fixed hard cap) and only affects planning.
+    context_planning_ceiling = max(1, context_window_tokens - LLM_TOKEN_SAFETY_MARGIN - 1)
+    if desired_output_tokens > context_planning_ceiling:
+        logger.info(
+            "Configured output tokens exceed context-derived ceiling: configured=%d, ceiling=%d",
+            desired_output_tokens,
+            context_planning_ceiling,
+        )
+        desired_output_tokens = context_planning_ceiling
 
     prompt_char_budget = _estimate_prompt_char_budget_for_context(
         context_window_tokens,
@@ -442,6 +452,7 @@ def _resolve_context_plan_for_llm(llm_row: sqlite3.Row | None) -> dict[str, Any]
         "context_window_tokens": context_window_tokens,
         "configured_max_tokens": configured_max_tokens,
         "model_max_output_tokens": model_max_output_tokens,
+        "context_planning_ceiling": context_planning_ceiling,
         "desired_output_tokens": desired_output_tokens,
         "prompt_char_budget": prompt_char_budget,
         "target_prompt_tokens": target_prompt_tokens,
@@ -867,7 +878,11 @@ class LLMConfigBase(BaseModel):
     base_url: str = Field(..., min_length=1, description="API base URL")
     api_key: str = Field(..., min_length=1, description="API key")
     model: str = Field(..., min_length=1, description="Model name")
-    max_tokens: int | None = Field(default=None, ge=1, le=128000, description="Max output tokens (leave buffer for input prompt overhead)")
+    max_tokens: int | None = Field(
+        default=None,
+        ge=1,
+        description="Max output tokens (no fixed hard cap; constrained by model context at runtime)",
+    )
     temperature: float | None = Field(default=None, ge=0.0, le=2.0, description="Temperature for generation")
     is_default: bool = Field(default=False, description="Set as default configuration")
 

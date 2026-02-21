@@ -590,7 +590,18 @@
             });
             if (!response.ok) {
                 const error = await response.json().catch(() => ({ error: 'Request failed' }));
-                throw new Error(error.error || error.detail || 'Request failed');
+                let message = error.error || 'Request failed';
+                if (Array.isArray(error.detail)) {
+                    const first = error.detail[0];
+                    if (first) {
+                        const field = Array.isArray(first.loc) ? first.loc.join('.') : '';
+                        const msg = first.msg || '';
+                        message = field ? `${field}: ${msg}` : (msg || message);
+                    }
+                } else if (typeof error.detail === 'string' && error.detail.trim()) {
+                    message = error.detail;
+                }
+                throw new Error(message);
             }
             return response.json();
         }
