@@ -356,12 +356,13 @@
                     <select id="webhook-type" class="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-primary">
                         <option value="discord">Discord</option>
                         <option value="slack">Slack</option>
+                        <option value="feishu">飞书</option>
                         <option value="custom">自定义</option>
                     </select>
                 </div>
                 <div>
                     <label class="block text-sm text-gray-400 mb-1">Webhook URL</label>
-                    <input type="text" id="webhook-url" placeholder="https://discord.com/api/webhooks/..."
+                    <input type="text" id="webhook-url" placeholder="https://discord.com/... 或 https://open.feishu.cn/..."
                         class="w-full bg-gray-700 border border-gray-600 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-primary">
                 </div>
                 <div class="flex items-center">
@@ -936,7 +937,7 @@
             } else {
                 document.getElementById('webhook-modal-title').textContent = '添加 Webhook';
                 document.getElementById('webhook-id').value = '';
-                document.getElementById('webhook-url').placeholder = 'https://discord.com/api/webhooks/...';
+                document.getElementById('webhook-url').placeholder = 'https://discord.com/... 或 https://open.feishu.cn/...';
             }
         }
 

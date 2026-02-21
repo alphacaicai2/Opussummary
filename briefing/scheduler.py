@@ -21,6 +21,7 @@ from pathlib import Path
 from threading import RLock
 from typing import TYPE_CHECKING, Any, Callable, Protocol, runtime_checkable
 
+import httpx
 from apscheduler.jobstores.base import JobLookupError
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.base import BaseTrigger
@@ -167,6 +168,19 @@ def _fetch_default_webhook_from_db() -> dict[str, Any] | None:
     except Exception as e:
         logger.error("Failed to fetch default webhook from database: %s", e)
         return None
+
+
+def _is_feishu_webhook_url(url: str) -> bool:
+    """Return True when URL appears to be a Feishu bot webhook."""
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").lower()
+        path = parsed.path or ""
+        return "open.feishu.cn" in host and "/open-apis/bot/v2/hook/" in path
+    except Exception:
+        return False
 
 
 def _fetch_custom_template_from_db(template_id: str) -> dict[str, Any] | None:
@@ -1303,32 +1317,62 @@ class BriefingScheduler:
                 logger.warning("Webhook %s has empty URL, skipping", webhook_id)
                 continue
 
-            webhook_type = (webhook["type"] or "").lower()
-            if webhook_type != "discord":
-                logger.warning(
-                    "Webhook %s has unsupported type '%s', skipping",
-                    webhook_id,
-                    webhook_type,
-                )
+            webhook_type = (webhook["type"] or "discord").strip().lower()
+            if webhook_type == "discord":
+                # Send via Discord sender
+                sender = None
+                try:
+                    sender = self._create_sender(webhook["url"])
+                    messages_sent = sender.send_briefing(content)
+                    if messages_sent > 0:
+                        sent_count += 1
+                        logger.info("Sent briefing to webhook %s (%d message(s))", webhook_id, messages_sent)
+                    else:
+                        logger.warning("Failed to send briefing to webhook %s: no messages were sent", webhook_id)
+                except Exception as e:
+                    logger.exception("Failed to send to webhook %s: %s", webhook_id, e)
+                finally:
+                    if sender is not None:
+                        self._close_sender(sender)
                 continue
 
-            # Send via Discord sender
-            sender = None
-            try:
-                sender = self._create_sender(webhook["url"])
-                messages_sent = sender.send_briefing(content)
-                if messages_sent > 0:
-                    sent_count += 1
-                    logger.info("Sent briefing to webhook %s (%d message(s))", webhook_id, messages_sent)
-                else:
-                    logger.warning("Failed to send briefing to webhook %s: no messages were sent", webhook_id)
-            except Exception as e:
-                logger.exception("Failed to send to webhook %s: %s", webhook_id, e)
-            finally:
-                if sender is not None:
-                    self._close_sender(sender)
+            ok, detail = self._send_http_webhook(webhook_type, webhook["url"], content)
+            if ok:
+                sent_count += 1
+                logger.info("Sent briefing to webhook %s (%s)", webhook_id, detail)
+            else:
+                logger.warning("Failed to send briefing to webhook %s: %s", webhook_id, detail)
 
         return sent_count
+
+    @staticmethod
+    def _send_http_webhook(webhook_type: str, webhook_url: str, content: str) -> tuple[bool, str]:
+        """Send message to non-Discord HTTP webhooks."""
+        normalized = (webhook_type or "").strip().lower()
+        if normalized not in {"slack", "feishu", "custom"}:
+            return False, f"unsupported type '{normalized}'"
+
+        if normalized == "slack":
+            payload = {"text": content}
+        elif normalized == "feishu" or _is_feishu_webhook_url(webhook_url):
+            payload = {"msg_type": "text", "content": {"text": content}}
+        else:
+            payload = {"text": content}
+
+        try:
+            resp = httpx.post(webhook_url, json=payload, timeout=15.0)
+        except httpx.HTTPError as e:
+            return False, str(e)
+
+        if 200 <= resp.status_code < 300:
+            return True, f"{normalized} status={resp.status_code}"
+
+        detail = (resp.text or "").strip()
+        if detail:
+            detail = detail[:300]
+        else:
+            detail = "empty response"
+        return False, f"{normalized} status={resp.status_code} detail={detail}"
 
     def _create_sender(self, webhook_url: str) -> Any:
         """Create a sender instance for a webhook URL."""

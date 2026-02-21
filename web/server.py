@@ -1107,7 +1107,7 @@ class LLMConfigOut(BaseModel):
 class WebhookBase(BaseModel):
     """Base model for webhook configuration."""
     name: str = Field(..., min_length=1, max_length=100, description="Webhook name")
-    type: str = Field(default="discord", description="Webhook type (discord, slack, etc.)")
+    type: str = Field(default="discord", description="Webhook type (discord, slack, feishu, custom)")
     url: str = Field(..., min_length=1, description="Webhook URL")
     is_default: bool = Field(default=False, description="Set as default webhook")
     enabled: bool = Field(default=True, description="Enable or disable webhook")
@@ -1115,7 +1115,7 @@ class WebhookBase(BaseModel):
     @field_validator("type")
     @classmethod
     def validate_type(cls, v: str) -> str:
-        supported = {"discord", "slack"}
+        supported = {"discord", "slack", "feishu", "custom"}
         normalized = (v or "discord").strip().lower()
         if normalized not in supported:
             raise ValueError(
@@ -1313,7 +1313,7 @@ class WebhookTestRequest(BaseModel):
     """Model for webhook test."""
     webhook_id: int | None = Field(default=None, description="Webhook ID to test")
     url: str | None = Field(default=None, description="Override webhook URL")
-    type: str | None = Field(default=None, description="Override webhook type (discord, slack)")
+    type: str | None = Field(default=None, description="Override webhook type (discord, slack, feishu, custom)")
     content: str = Field(default="OpusSummary webhook test message", description="Test message content")
 
     @field_validator("type")
@@ -1322,7 +1322,7 @@ class WebhookTestRequest(BaseModel):
         """Validate webhook type if provided."""
         if v is None:
             return v
-        supported = {"discord", "slack"}
+        supported = {"discord", "slack", "feishu", "custom"}
         normalized = v.strip().lower()
         if normalized not in supported:
             raise ValueError(
@@ -1933,6 +1933,19 @@ def _resolve_webhook_targets(webhook_ids: list[int]) -> list[tuple[int, str, str
     return [(row["id"], row["type"], row["url"]) for row in rows]
 
 
+def _is_feishu_webhook_url(url: str) -> bool:
+    """Return True when URL appears to be a Feishu bot webhook."""
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").lower()
+        path = parsed.path or ""
+        return "open.feishu.cn" in host and "/open-apis/bot/v2/hook/" in path
+    except Exception:
+        return False
+
+
 def _send_webhook(webhook_type: str, url: str, content: str) -> tuple[bool, int, str]:
     """
     Send content to webhook URL according to webhook type.
@@ -1941,10 +1954,10 @@ def _send_webhook(webhook_type: str, url: str, content: str) -> tuple[bool, int,
     - Discord's 2000 character limit with automatic message chunking
     - Rate limiting with retry logic
     - Connection errors with proper error handling
-    - Multiple webhook types (discord, slack)
+    - Multiple webhook types (discord, slack, feishu, custom)
 
     Args:
-        webhook_type: Webhook type (discord, slack)
+        webhook_type: Webhook type (discord, slack, feishu, custom)
         url: Webhook URL
         content: Content to send (will be automatically chunked if too long)
 
@@ -1978,6 +1991,27 @@ def _send_webhook(webhook_type: str, url: str, content: str) -> tuple[bool, int,
             return False, resp.status_code, (resp.text[:300] if resp.text else "Slack webhook failed")
         except httpx.HTTPError as exc:
             logger.error("Slack webhook send failed: %s", exc)
+            return False, 0, str(exc)
+
+    if webhook_type in {"feishu", "custom"}:
+        try:
+            payload: dict[str, Any]
+            if webhook_type == "feishu" or _is_feishu_webhook_url(url):
+                payload = {
+                    "msg_type": "text",
+                    "content": {"text": content},
+                }
+                success_detail = "Feishu message sent successfully"
+            else:
+                payload = {"text": content}
+                success_detail = "Custom webhook message sent successfully"
+
+            resp = httpx.post(url, json=payload, timeout=15.0)
+            if 200 <= resp.status_code < 300:
+                return True, resp.status_code, success_detail
+            return False, resp.status_code, (resp.text[:300] if resp.text else f"{webhook_type} webhook failed")
+        except httpx.HTTPError as exc:
+            logger.error("%s webhook send failed: %s", webhook_type.capitalize(), exc)
             return False, 0, str(exc)
 
     return False, 400, f"Unsupported webhook type: {webhook_type}"
