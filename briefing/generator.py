@@ -682,29 +682,21 @@ class BriefingGenerator:
                     continue
 
                 # Validate required sections using line-start regex for precision
+                # Note: Validation is now warn-only to allow flexible prompt design
                 missing_sections = [
                     section
                     for section in template.required_sections
                     if not re.search(rf"^{re.escape(section)}", output, re.MULTILINE)
                 ]
 
-                if not missing_sections:
-                    return output
+                if missing_sections:
+                    logger.warning(
+                        "简报结构不完整 (仅警告，不重试): missing=%s",
+                        missing_sections,
+                    )
 
-                # Structure validation failed - prepare retry
-                last_error = f"缺少固定章节: {', '.join(missing_sections)}"
-                logger.warning(
-                    "简报结构不完整，attempt=%s/%s, missing=%s",
-                    attempt + 1,
-                    self._max_retries + 1,
-                    missing_sections,
-                )
-
-                # Enhance prompt for retry
-                current_prompt = self._build_retry_prompt(
-                    original_prompt=user_prompt,
-                    missing_sections=missing_sections,
-                )
+                # Return output regardless of validation result
+                return output
 
             except Exception as exc:
                 last_error = f"LLM API 调用失败: {exc}"

@@ -446,7 +446,7 @@ class LLMConfigBase(BaseModel):
     base_url: str = Field(..., min_length=1, description="API base URL")
     api_key: str = Field(..., min_length=1, description="API key")
     model: str = Field(..., min_length=1, description="Model name")
-    max_tokens: int | None = Field(default=None, ge=1, le=128000, description="Max tokens for generation")
+    max_tokens: int | None = Field(default=None, ge=1, le=128000, description="Max output tokens (leave buffer for input prompt overhead)")
     temperature: float | None = Field(default=None, ge=0.0, le=2.0, description="Temperature for generation")
     is_default: bool = Field(default=False, description="Set as default configuration")
 
@@ -464,8 +464,8 @@ class LLMConfigOut(BaseModel):
     base_url: str
     model: str
     api_key_masked: str = Field(..., description="Masked API key (e.g., sk-***abc)")
-    max_tokens: int | None = Field(default=None, description="Max tokens for generation")
-    temperature: float | None = Field(default=None, description="Temperature for generation")
+    max_tokens: int | None = Field(default=None, description="Max output tokens (leave buffer for input)")
+    temperature: float | None = Field(default=None, description="Sampling temperature (0.0-2.0)")
     is_default: bool
     created_at: str
     updated_at: str
