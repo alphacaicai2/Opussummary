@@ -49,8 +49,9 @@ from .templates import (
     list_prompt_templates,
     validate_template_id,
 )
+from app_version import get_version
 
-__version__ = "1.0.0"
+__version__ = get_version()
 
 # Backward compatibility alias
 LLMClient = LLMClientProtocol

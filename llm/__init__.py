@@ -82,6 +82,7 @@ from .providers import (
     list_providers,
     resolve_base_url,
 )
+from app_version import get_version
 
 __all__ = [
     # 客户端
@@ -107,4 +108,4 @@ __all__ = [
     "LLMServiceError",
 ]
 
-__version__ = "0.1.0"
+__version__ = get_version()

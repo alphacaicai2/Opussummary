@@ -60,6 +60,25 @@ docker compose up -d
 
 ---
 
+## 版本号自动更新
+
+项目使用根目录 `VERSION` 作为统一版本源。  
+每次 `git commit` 会自动执行 patch 递增（例如 `0.1.0 -> 0.1.1`）。
+
+首次拉取后请在仓库执行：
+
+```bash
+git config core.hooksPath .githooks
+```
+
+如需临时跳过（不建议），可设置：
+
+```bash
+OPUS_SKIP_VERSION_BUMP=1 git commit -m "your message"
+```
+
+---
+
 ## 配置说明
 
 ```json

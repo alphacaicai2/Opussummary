@@ -37,6 +37,7 @@ from briefing.templates import (
     list_prompt_templates,
     PromptTemplate,
 )
+from app_version import get_version
 from llm.client import LLMClient
 from miniflux_client import MinifluxClient
 from sender.discord import DiscordSender, DiscordSenderError
@@ -54,6 +55,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 logger = logging.getLogger("opus.web")
 _BOOTSTRAPPED = False
+APP_VERSION = get_version()
 
 # LLM Provider presets
 LLM_PROVIDERS = {
@@ -2384,7 +2386,7 @@ def create_app() -> FastAPI:
 
     app = FastAPI(
         title="OpusBrief Web Admin",
-        version="0.1.0",
+        version=APP_VERSION,
         description="Web administration interface for OpusBrief RSS briefing system",
         lifespan=lifespan,
     )
