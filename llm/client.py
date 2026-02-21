@@ -218,6 +218,7 @@ class LLMClient:
         self.provider_id = provider_id
         self.api_style = api_style
         self._timeout = timeout
+        self._sync_loop: asyncio.AbstractEventLoop | None = None
 
         # 创建 HTTP 客户端
         self._client = httpx.AsyncClient(
@@ -287,8 +288,10 @@ class LLMClient:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            # 不在事件循环中，可以安全使用 asyncio.run
-            return asyncio.run(coro)
+            # 不在事件循环中：复用同一事件循环，避免每次 asyncio.run 导致 loop 关闭
+            if self._sync_loop is None or self._sync_loop.is_closed():
+                self._sync_loop = asyncio.new_event_loop()
+            return self._sync_loop.run_until_complete(coro)
         # 已在事件循环中，不能嵌套运行
         raise RuntimeError(
             "当前已在异步事件循环中，请使用 *_async 方法代替同步方法。"
@@ -602,7 +605,8 @@ class LLMClient:
 
         # Log error response details before raising
         if resp.status_code >= 400:
-            logger.error(
+            log_fn = logger.info if resp.status_code == 413 else logger.error
+            log_fn(
                 "=== LLM API Error Response ===\n"
                 "  Status: %d\n"
                 "  Model: %s\n"
@@ -1068,4 +1072,21 @@ class LLMClient:
         注意：如果在异步上下文中调用此方法，会抛出 RuntimeError。
         此时应使用 close_async() 方法或使用 async with 语句。
         """
-        self._run_sync(self.close_async())
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError(
+                "当前已在异步事件循环中，请使用 close_async() 代替 close()。"
+            )
+
+        loop = self._sync_loop
+        if loop is None or loop.is_closed():
+            loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(self.close_async())
+        finally:
+            if not loop.is_closed():
+                loop.close()
+            self._sync_loop = None

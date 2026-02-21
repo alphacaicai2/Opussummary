@@ -78,6 +78,11 @@ def _is_payload_too_large_error(exc: Exception) -> bool:
     return any(marker in message for marker in markers)
 
 
+def _is_event_loop_closed_error(exc: Exception) -> bool:
+    """Detect transient closed-event-loop errors from sync wrappers."""
+    return "event loop is closed" in str(exc).lower()
+
+
 # =============================================================================
 # Exceptions
 # =============================================================================
@@ -702,7 +707,7 @@ class BriefingGenerator:
                 ]
 
                 if missing_sections:
-                    logger.warning(
+                    logger.info(
                         "简报结构提示（仅提示，不影响结果）: missing=%s",
                         missing_sections,
                     )
@@ -711,19 +716,40 @@ class BriefingGenerator:
 
             except Exception as exc:
                 last_error = f"LLM API 调用失败: {exc}"
-                logger.error(
-                    "LLM API 调用异常，attempt=%s/%s, error=%s",
-                    attempt + 1,
-                    self._max_retries + 1,
-                    exc,
-                )
                 # Request-body-too-large errors are not retryable with identical input.
                 if _is_payload_too_large_error(exc):
+                    logger.info(
+                        "LLM 请求体超限，停止同请求重试，attempt=%s/%s, error=%s",
+                        attempt + 1,
+                        self._max_retries + 1,
+                        exc,
+                    )
                     raise LLMSyntaxError(
                         f"简报生成失败（请求体过大）: {last_error}",
                         template_id=template.template_id.value,
                         attempt_count=attempt + 1,
                     ) from exc
+                if _is_event_loop_closed_error(exc):
+                    logger.info(
+                        "检测到事件循环已关闭，准备重试，attempt=%s/%s",
+                        attempt + 1,
+                        self._max_retries + 1,
+                    )
+                    continue
+                if attempt < self._max_retries:
+                    logger.info(
+                        "LLM API 调用异常，准备重试，attempt=%s/%s, error=%s",
+                        attempt + 1,
+                        self._max_retries + 1,
+                        exc,
+                    )
+                else:
+                    logger.error(
+                        "LLM API 调用异常，attempt=%s/%s, error=%s",
+                        attempt + 1,
+                        self._max_retries + 1,
+                        exc,
+                    )
 
         # All retries exhausted
         raise LLMSyntaxError(

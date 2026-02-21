@@ -1884,7 +1884,7 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                     target_prompt_tokens,
                 )
                 if len(article_batches) > 1:
-                    logger.warning(
+                    logger.info(
                         "Grouped generation activated: total_articles=%d, batches=%d, target_prompt_tokens=%d",
                         len(articles),
                         len(article_batches),
@@ -1898,7 +1898,7 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                     estimated_prompt_tokens,
                 )
                 if effective_max_tokens < plan["desired_output_tokens"]:
-                    logger.warning(
+                    logger.info(
                         "Prompt is still near context limit (target_prompt_tokens=%d, estimated=%d); max_tokens reduced to %d",
                         target_prompt_tokens,
                         estimated_prompt_tokens,
@@ -2000,7 +2000,7 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                                 left = batch_articles[:mid]
                                 right = batch_articles[mid:]
                                 batch_queue = [left, right] + batch_queue
-                                logger.warning(
+                                logger.info(
                                     "Batch payload too large; split and retry: old=%d, left=%d, right=%d",
                                     len(batch_articles),
                                     len(left),
@@ -2012,7 +2012,7 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                             if split_single is not None:
                                 left, right = split_single
                                 batch_queue = [[left], [right]] + batch_queue
-                                logger.warning(
+                                logger.info(
                                     "Single-article batch too large; split article content and retry"
                                 )
                                 continue
@@ -2094,11 +2094,11 @@ def generate_briefing(payload: GenerateRequest) -> dict[str, Any]:
                         else:
                             content = _merge_grouped_markdowns(batch_results)
                             used_llm = True
-                            logger.warning("Grouped synthesis returned empty content; fallback to merged batch markdown")
+                            logger.info("Grouped synthesis returned empty content; fallback to merged batch markdown")
                     else:
                         content = _merge_grouped_markdowns(batch_results)
                         used_llm = True
-                        logger.warning(
+                        logger.info(
                             "Grouped synthesis skipped because batch summaries still exceed prompt budget: synthesis_batches=%d",
                             len(synthesis_batches),
                         )
