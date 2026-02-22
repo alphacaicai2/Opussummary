@@ -6,7 +6,7 @@ services:
     container_name: opusbrief
     restart: unless-stopped
     ports:
-      - "8812:8812"
+      - "127.0.0.1:8812:8812"
     volumes:
       - ./data:/app/data
       - ./.env:/app/.env
