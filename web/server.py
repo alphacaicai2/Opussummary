@@ -1219,6 +1219,7 @@ class TaskLatestBriefing(BaseModel):
 class TaskWithStatus(TaskOut):
     """Task output with latest briefing status."""
     latest_briefing: TaskLatestBriefing | None = None
+    next_run_at: str | None = None  # ISO datetime when scheduler will run this task next, or None if not scheduled
 
 
 class PreviewCountRequest(BaseModel):
@@ -2980,16 +2981,21 @@ def create_app() -> FastAPI:
 
     @app.get("/api/tasks", response_model=list[TaskWithStatus])
     def list_tasks() -> list[TaskWithStatus]:
-        """List all briefing tasks with their latest briefing status."""
+        """List all briefing tasks with their latest briefing status and next run time."""
         results: list[TaskWithStatus] = []
         with _get_conn() as conn:
             rows = conn.execute("SELECT * FROM tasks ORDER BY id DESC").fetchall()
             for row in rows:
                 task = _task_row_to_model(row)
                 latest_briefing = _get_latest_briefing_for_task(conn, task.id)
+                next_run_at: str | None = None
+                if _app_scheduler and _app_scheduler.is_running():
+                    next_dt = _app_scheduler.get_next_run_time(task.id)
+                    next_run_at = next_dt.isoformat() if next_dt else None
                 results.append(TaskWithStatus(
                     **task.model_dump(),
                     latest_briefing=latest_briefing,
+                    next_run_at=next_run_at,
                 ))
         return results
 

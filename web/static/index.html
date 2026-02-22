@@ -1380,11 +1380,20 @@
             function renderStatusLog(task) {
                 const latest = task.latest_briefing;
                 if (!latest) {
+                    let nextRunHtml = '<span>尚未执行过</span>';
+                    if (task.schedule === 'cron' && task.enabled) {
+                        if (task.next_run_at) {
+                            const nextRun = new Date(task.next_run_at);
+                            nextRunHtml += ` <span class="text-gray-400">· 下次运行: ${nextRun.toLocaleString()}</span>`;
+                        } else {
+                            nextRunHtml += ` <span class="text-amber-400" title="定时任务未加入调度，请确认进程在设定时间前已启动">· 未加入调度</span>`;
+                        }
+                    }
                     return `
                         <div class="mt-3 pt-3 border-t border-gray-700/50">
                             <div class="flex items-center space-x-2 text-xs text-gray-500">
                                 <span class="text-gray-500">○</span>
-                                <span>尚未执行过</span>
+                                ${nextRunHtml}
                             </div>
                         </div>
                     `;

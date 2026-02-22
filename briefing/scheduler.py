@@ -981,28 +981,37 @@ class BriefingScheduler:
             return
 
         try:
-            # Generate briefing content
-            content = self._generate_briefing(task)
+            result = self._generate_briefing(task)
 
-            if not content:
-                logger.warning("Task %s produced empty content", task_id)
+            if result is None:
+                logger.warning("Task %s produced no result", task_id)
                 return
 
-            # Send to webhooks
-            sent_count = self._send_to_webhooks(task, content)
-
-            # Log result with appropriate level based on sent count
-            if sent_count > 0:
+            if isinstance(result, dict):
+                # generate_briefing already saved to DB and sent webhooks
                 logger.info(
-                    "Task %s completed successfully: sent_to=%d webhook(s)",
+                    "Task %s completed: briefing id=%s status=%s",
                     task_id,
-                    sent_count,
+                    result.get("id"),
+                    result.get("status"),
                 )
-            else:
-                logger.warning(
-                    "Task %s completed but no webhooks received the briefing (sent=0)",
-                    task_id,
-                )
+                return
+
+            if isinstance(result, str):
+                if result:
+                    sent_count = self._send_to_webhooks(task, result)
+                    if sent_count > 0:
+                        logger.info(
+                            "Task %s completed successfully: sent_to=%d webhook(s)",
+                            task_id,
+                            sent_count,
+                        )
+                    else:
+                        logger.warning(
+                            "Task %s completed but no webhooks received the briefing (sent=0)",
+                            task_id,
+                        )
+                return
 
         except TaskExecutionError:
             raise
@@ -1010,164 +1019,47 @@ class BriefingScheduler:
             logger.exception("Task %s execution failed: %s", task_id, e)
             raise TaskExecutionError(f"Task {task_id} execution failed") from e
 
-    def _generate_briefing(self, task: Any) -> str:
+    def _generate_briefing(self, task: Any) -> dict[str, Any] | str | None:
         """
-        Generate briefing content for a task.
+        Generate briefing for a task using the same logic as the Web path.
 
-        This method:
-        1. Fetches articles from Miniflux based on task's categories and time range
-        2. Creates a BriefingGenerateRequest with the articles
-        3. Calls the BriefingGenerator to generate content
+        Builds a GenerateRequest from the task and calls web.server.generate_briefing,
+        so Miniflux fetch, generation, DB save, and webhook delivery are unified.
 
         Args:
             task: The briefing task configuration (WebTask).
 
         Returns:
-            The generated briefing content as a string.
+            The dict returned by generate_briefing (id, status, content, etc.),
+            or None on failure. For backward compatibility, may be a string (content only).
 
         Raises:
-            TaskExecutionError: If briefing generation fails.
+            TaskExecutionError: If briefing generation fails (e.g. HTTPException from server).
         """
-        # Get task parameters
-        category_ids = task.categories or []
-        time_range_hours = task.time_range_hours or 24
-        template = task.template or "general"
-        timezone_name = task.timezone or "Asia/Shanghai"
+        from fastapi import HTTPException
 
-        # Step 1: Get Miniflux configuration
+        from web.server import GenerateRequest, generate_briefing
+
+        webhook_ids = (
+            task.get_webhook_ids()
+            if hasattr(task, "get_webhook_ids")
+            else (getattr(task, "webhook_ids", None) or [])
+        )
+        payload = GenerateRequest(
+            task_id=task.id,
+            template=task.template or "general",
+            category_ids=task.categories or [],
+            time_range_hours=task.time_range_hours or 24,
+            llm_config_id=task.llm_config_id,
+            webhook_ids=webhook_ids,
+        )
         try:
-            miniflux_url, miniflux_token = _resolve_miniflux_config()
-        except TaskExecutionError:
-            raise
-        except Exception as e:
-            raise TaskExecutionError(f"Failed to resolve Miniflux config: {e}") from e
-
-        # Step 2: Fetch entries from Miniflux
-        try:
-            entries = _collect_entries_from_miniflux(
-                url=miniflux_url,
-                token=miniflux_token,
-                category_ids=category_ids,
-                time_range_hours=time_range_hours,
-            )
-        except Exception as e:
-            raise TaskExecutionError(f"Failed to fetch entries from Miniflux: {e}") from e
-
-        logger.info(
-            "Task %s: fetched %d entries from Miniflux (categories=%s, hours=%d)",
-            task.id,
-            len(entries),
-            category_ids if category_ids else "all",
-            time_range_hours,
-        )
-
-        # Step 3: Prepare articles for briefing
-        articles = _prepare_articles_for_briefing(entries)
-
-        if not articles:
-            logger.info("Task %s: no articles to process, returning empty content", task.id)
-            return "# OpusBrief\n\n暂无符合条件的文章。\n"
-
-        # Step 4: Resolve LLM config for generation parameters
-        llm_config = _resolve_llm_config_for_task(getattr(task, "llm_config_id", None))
-        if llm_config is None:
-            raise TaskExecutionError(
-                f"No LLM configuration available for task {getattr(task, 'id', 'unknown')}"
-            )
-        llm_max_tokens = llm_config.get("max_tokens")
-        llm_temperature = llm_config.get("temperature")
-
-        # Step 5: Create generator with LLM client
-        generator = self._get_generator(task)
-
-        # Step 6: Create BriefingGenerateRequest and generate
-        prompt_char_budget = _estimate_prompt_char_budget(llm_max_tokens)
-        logger.info(
-            "Task %s: prompt_char_budget=%d (entries=%d, configured_max_tokens=%s)",
-            task.id,
-            prompt_char_budget,
-            len(entries),
-            llm_max_tokens if llm_max_tokens is not None else "(default)",
-        )
-
-        desired_output_tokens = llm_max_tokens or LLM_DEFAULT_MAX_TOKENS
-        trimmed_count, target_prompt_tokens = _trim_articles_to_fit_context_window(
-            articles,
-            desired_output_tokens,
-        )
-        if trimmed_count > 0:
-            logger.warning(
-                "Task %s: trimmed %d article(s) to preserve output token budget",
-                task.id,
-                trimmed_count,
-            )
-
-        estimated_prompt_tokens = _estimate_prompt_tokens_from_articles(articles)
-        effective_max_tokens = _resolve_effective_max_tokens(
-            desired_output_tokens,
-            estimated_prompt_tokens,
-        )
-        if effective_max_tokens < desired_output_tokens:
-            logger.warning(
-                "Task %s: prompt near context limit (target_prompt_tokens=%d, estimated=%d); max_tokens reduced to %d",
-                task.id,
-                target_prompt_tokens,
-                estimated_prompt_tokens,
-                effective_max_tokens,
-            )
-
-        try:
-            from briefing.generator import BriefingGenerateRequest, BriefingTemplate
-
-            # Normalize template
-            try:
-                resolved_template = BriefingTemplate(template.lower())
-            except ValueError:
-                resolved_template = BriefingTemplate.GENERAL
-
-            # Check for custom template in database
-            custom_template = _fetch_custom_template_from_db(template.lower())
-            custom_kwargs = {}
-            if custom_template:
-                logger.info(
-                    "Task %s: using custom template '%s' from database",
-                    task.id,
-                    template.lower(),
-                )
-                custom_kwargs = {
-                    "custom_system_prompt": custom_template.get("system_prompt"),
-                    "custom_user_prompt_template": custom_template.get("user_prompt_template"),
-                    "custom_required_sections": tuple(custom_template.get("required_sections", [])),
-                }
-
-            request = BriefingGenerateRequest(
-                template=resolved_template,
-                articles=articles,
-                timezone=timezone_name,
-                time_range_hours=time_range_hours,
-                output_format="markdown",
-                prompt_char_budget=prompt_char_budget,
-                max_tokens=effective_max_tokens,
-                temperature=llm_temperature,
-                **custom_kwargs,
-            )
-
-            result = generator.generate(request)
-
-            if result and result.markdown:
-                logger.info(
-                    "Task %s: generated briefing successfully (%d chars)",
-                    task.id,
-                    len(result.markdown),
-                )
-                return result.markdown
-            else:
-                raise TaskExecutionError("Generator returned empty content")
-
-        except TaskExecutionError:
-            raise
-        except Exception as e:
-            raise TaskExecutionError(f"Briefing generation failed: {e}") from e
+            result = generate_briefing(payload)
+            return result
+        except HTTPException as e:
+            detail = e.detail
+            msg = detail if isinstance(detail, str) else str(detail) if detail is not None else str(e)
+            raise TaskExecutionError(msg) from e
 
     def _get_generator(self, task: Any) -> Any:
         """
