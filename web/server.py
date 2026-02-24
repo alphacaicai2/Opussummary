@@ -31,7 +31,7 @@ from uuid import uuid4
 import httpx
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
@@ -3020,6 +3020,7 @@ def create_app() -> FastAPI:
         logger.info("Feishu login is disabled.")
 
     auth_exempt_paths = {
+        "/login",
         "/auth/feishu/login",
         "/auth/feishu/callback",
         "/api/auth/status",
@@ -3043,12 +3044,12 @@ def create_app() -> FastAPI:
         if path.startswith("/api/"):
             return JSONResponse(
                 status_code=401,
-                content={"error": "Authentication required", "login_url": "/auth/feishu/login"},
+                content={"error": "Authentication required", "login_url": "/login"},
             )
 
         next_path = _sanitize_next_path(path + (f"?{request.url.query}" if request.url.query else ""))
         return RedirectResponse(
-            url=f"/auth/feishu/login?{urlencode({'next': next_path})}",
+            url=f"/login?{urlencode({'next': next_path})}",
             status_code=307,
         )
 
@@ -3064,7 +3065,7 @@ def create_app() -> FastAPI:
                 "enabled": False,
                 "authenticated": True,
                 "user": None,
-                "login_url": "/auth/feishu/login",
+                "login_url": "/login",
             }
 
         user = _read_auth_session(request, auth_cfg)
@@ -3072,7 +3073,7 @@ def create_app() -> FastAPI:
             "enabled": True,
             "authenticated": bool(user),
             "user": user,
-            "login_url": "/auth/feishu/login",
+            "login_url": "/login",
         }
 
     @app.post("/api/auth/logout")
@@ -3081,6 +3082,83 @@ def create_app() -> FastAPI:
         response = JSONResponse({"ok": True})
         response.delete_cookie(key=AUTH_SESSION_COOKIE, path="/")
         return response
+
+    @app.get("/login", include_in_schema=False)
+    def login_page(request: Request, next_path: str = Query(default="/", alias="next")) -> Response:
+        """Render login guide page instead of immediate OAuth redirect."""
+        target_path = _sanitize_next_path(next_path)
+        if not auth_cfg["enabled"]:
+            return RedirectResponse(url=target_path, status_code=302)
+        if _read_auth_session(request, auth_cfg):
+            return RedirectResponse(url=target_path, status_code=302)
+
+        auth_start_url = f"/auth/feishu/login?{urlencode({'next': target_path})}"
+        html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>飞书登录</title>
+  <style>
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #0f172a;
+      color: #e2e8f0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }}
+    .card {{
+      width: min(92vw, 420px);
+      border: 1px solid #334155;
+      background: #111827;
+      border-radius: 16px;
+      padding: 28px 24px;
+      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+      text-align: center;
+    }}
+    h1 {{
+      margin: 0 0 12px;
+      font-size: 22px;
+      color: #f8fafc;
+    }}
+    p {{
+      margin: 0 0 16px;
+      color: #cbd5e1;
+      font-size: 14px;
+      line-height: 1.6;
+    }}
+    .btn {{
+      display: inline-block;
+      margin-top: 6px;
+      width: 100%;
+      background: #2563eb;
+      color: #fff;
+      text-decoration: none;
+      border-radius: 10px;
+      padding: 12px 14px;
+      font-weight: 600;
+      box-sizing: border-box;
+    }}
+    .hint {{
+      margin-top: 14px;
+      font-size: 12px;
+      color: #94a3b8;
+    }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>飞书扫码登录</h1>
+    <p>点击下方按钮进入飞书授权页。<br/>若未登录飞书，将显示二维码供扫码登录。</p>
+    <a class="btn" href="{auth_start_url}">前往飞书登录</a>
+    <div class="hint">登录完成后会自动返回系统。</div>
+  </div>
+</body>
+</html>"""
+        return HTMLResponse(content=html, status_code=200)
 
     @app.get("/auth/feishu/login", include_in_schema=False, name="feishu_login")
     def feishu_login(request: Request, next_path: str = Query(default="/", alias="next")) -> RedirectResponse:

@@ -581,7 +581,7 @@
                 enabled: false,
                 authenticated: true,
                 user: null,
-                login_url: '/auth/feishu/login'
+                login_url: '/login'
             },
             llmConfigs: [],
             webhooks: [],
@@ -599,7 +599,7 @@
         }
 
         function buildLoginUrl(baseUrl) {
-            const loginBase = baseUrl || '/auth/feishu/login';
+            const loginBase = baseUrl || '/login';
             const separator = loginBase.includes('?') ? '&' : '?';
             return `${loginBase}${separator}next=${encodeURIComponent(getCurrentPathForLogin())}`;
         }

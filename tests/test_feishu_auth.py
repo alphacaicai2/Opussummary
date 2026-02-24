@@ -58,13 +58,19 @@ class FeishuAuthTests(unittest.TestCase):
             resp = client.get("/api/settings", follow_redirects=False)
             self.assertEqual(resp.status_code, 401)
             payload = resp.json()
-            self.assertEqual(payload.get("login_url"), "/auth/feishu/login")
+            self.assertEqual(payload.get("login_url"), "/login")
 
             status = client.get("/api/auth/status")
             self.assertEqual(status.status_code, 200)
             status_payload = status.json()
             self.assertTrue(status_payload["enabled"])
             self.assertFalse(status_payload["authenticated"])
+            self.assertEqual(status_payload.get("login_url"), "/login")
+
+            page_resp = client.get("/login?next=%2F", follow_redirects=False)
+            self.assertEqual(page_resp.status_code, 200)
+            self.assertIn("飞书扫码登录", page_resp.text)
+            self.assertIn("/auth/feishu/login?next=%2F", page_resp.text)
 
     @patch("web.server.httpx.get")
     @patch("web.server.httpx.post")
