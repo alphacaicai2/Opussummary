@@ -17,16 +17,21 @@ import os
 import sqlite3
 import threading
 import time
+import base64
+import hashlib
+import hmac
+import secrets
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Generator, Optional
+from urllib.parse import urlencode
 from uuid import uuid4
 
 import httpx
-from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
@@ -98,6 +103,9 @@ LLM_RELEVANCE_TEMPERATURE = 0.0
 LLM_ARTICLE_CONTENT_CHAR_LIMIT = 2400
 MODEL_LIMIT_CACHE_TTL_SECONDS = 600
 LLM_BATCH_SYNTHESIS_ARTICLE_CONTENT_CHAR_LIMIT = 3200
+AUTH_SESSION_COOKIE = "opus_session"
+AUTH_STATE_TTL_SECONDS = 600
+AUTH_SESSION_TTL_SECONDS = 12 * 60 * 60
 
 _MODEL_LIMIT_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _MODEL_LIMIT_CACHE_LOCK = threading.Lock()
@@ -747,6 +755,284 @@ def _json_loads(value: str | None, fallback: Any) -> Any:
         return json.loads(value)
     except json.JSONDecodeError:
         return fallback
+
+
+def _parse_csv_set(raw: str | None) -> set[str]:
+    """Parse comma-separated text into a normalized set."""
+    if not raw:
+        return set()
+    return {item.strip().lower() for item in raw.split(",") if item.strip()}
+
+
+def _is_truthy(raw: str | None) -> bool:
+    """Parse environment variable style boolean."""
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _load_feishu_auth_config() -> dict[str, Any]:
+    """
+    Load Feishu login configuration from environment variables.
+
+    FEISHU_LOGIN_ENABLED:
+    - empty: auto-enable when CLIENT_ID + APP_SECRET are set
+    - true/false: explicit override
+    """
+    client_id = (os.getenv("FEISHU_CLIENT_ID", "") or os.getenv("FEISHU_APP_ID", "")).strip()
+    app_secret = os.getenv("FEISHU_APP_SECRET", "").strip()
+    enabled_raw = os.getenv("FEISHU_LOGIN_ENABLED")
+    enabled = _is_truthy(enabled_raw) if enabled_raw is not None else bool(client_id and app_secret)
+
+    if enabled and (not client_id or not app_secret):
+        logger.error(
+            "Feishu login is enabled but FEISHU_CLIENT_ID(or FEISHU_APP_ID)/FEISHU_APP_SECRET is missing; disabling auth."
+        )
+        enabled = False
+
+    session_secret = (os.getenv("FEISHU_SESSION_SECRET", "") or os.getenv("WEB_SESSION_SECRET", "")).strip()
+    if enabled and not session_secret:
+        # 允许服务启动，但会在重启后使已登录会话失效。
+        session_secret = secrets.token_urlsafe(48)
+        logger.warning(
+            "FEISHU_SESSION_SECRET is not set; using ephemeral secret. Sessions will be invalidated after restart."
+        )
+
+    cookie_secure_mode = (os.getenv("FEISHU_COOKIE_SECURE", "auto") or "auto").strip().lower()
+    if cookie_secure_mode not in {"auto", "true", "false"}:
+        cookie_secure_mode = "auto"
+
+    return {
+        "enabled": enabled,
+        "client_id": client_id,
+        "app_secret": app_secret,
+        "session_secret": session_secret,
+        "redirect_uri": os.getenv("FEISHU_REDIRECT_URI", "").strip(),
+        "authorize_url": (
+            os.getenv(
+                "FEISHU_OAUTH_AUTHORIZE_URL",
+                "https://accounts.feishu.cn/open-apis/authen/v1/authorize",
+            ).strip()
+        ),
+        "token_url": (
+            os.getenv(
+                "FEISHU_OAUTH_TOKEN_URL",
+                "https://open.feishu.cn/open-apis/authen/v2/oauth/token",
+            ).strip()
+        ),
+        "userinfo_url": (
+            os.getenv(
+                "FEISHU_OAUTH_USERINFO_URL",
+                "https://open.feishu.cn/open-apis/authen/v1/user_info",
+            ).strip()
+        ),
+        "scope": os.getenv("FEISHU_OAUTH_SCOPE", "").strip(),
+        "allowed_identifiers": _parse_csv_set(os.getenv("FEISHU_ALLOWED_IDENTIFIERS")),
+        "allowed_email_domains": _parse_csv_set(os.getenv("FEISHU_ALLOWED_EMAIL_DOMAINS")),
+        "cookie_secure_mode": cookie_secure_mode,
+    }
+
+
+def _b64url_encode(raw: bytes) -> str:
+    """URL-safe base64 encoding without padding."""
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(raw: str) -> bytes:
+    """URL-safe base64 decoding with padding recovery."""
+    padding = "=" * ((4 - len(raw) % 4) % 4)
+    return base64.urlsafe_b64decode(raw + padding)
+
+
+def _sign_token_body(body: str, secret: str) -> str:
+    """Sign token body with HMAC-SHA256."""
+    return hmac.new(secret.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _encode_signed_payload(payload: dict[str, Any], secret: str) -> str:
+    """Encode payload as signed token."""
+    body = _b64url_encode(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    signature = _sign_token_body(body, secret)
+    return f"{body}.{signature}"
+
+
+def _decode_signed_payload(token: str, secret: str) -> dict[str, Any] | None:
+    """Decode and verify signed token payload."""
+    if not token or "." not in token:
+        return None
+    body, signature = token.rsplit(".", 1)
+    expected = _sign_token_body(body, secret)
+    if not hmac.compare_digest(expected, signature):
+        return None
+    try:
+        payload = json.loads(_b64url_decode(body).decode("utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _request_scheme(request: Request) -> str:
+    """Resolve public request scheme with proxy headers support."""
+    forwarded = request.headers.get("x-forwarded-proto", "").strip()
+    if forwarded:
+        return forwarded.split(",")[0].strip().lower()
+    return request.url.scheme or "https"
+
+
+def _request_host(request: Request) -> str:
+    """Resolve public request host with proxy headers support."""
+    forwarded_host = request.headers.get("x-forwarded-host", "").strip()
+    if forwarded_host:
+        return forwarded_host.split(",")[0].strip()
+    host = request.headers.get("host", "").strip()
+    return host or request.url.netloc
+
+
+def _sanitize_next_path(raw: str | None) -> str:
+    """Only allow local relative paths to avoid open redirects."""
+    candidate = (raw or "/").strip()
+    if not candidate.startswith("/") or candidate.startswith("//"):
+        return "/"
+    return candidate
+
+
+def _resolve_feishu_redirect_uri(request: Request, auth_cfg: dict[str, Any]) -> str:
+    """Build callback URL for Feishu OAuth."""
+    configured = str(auth_cfg.get("redirect_uri") or "").strip()
+    if configured:
+        return configured
+    scheme = _request_scheme(request)
+    host = _request_host(request)
+    callback_path = str(request.app.url_path_for("feishu_callback"))
+    return f"{scheme}://{host}{callback_path}"
+
+
+def _build_feishu_authorize_url(
+    auth_cfg: dict[str, Any],
+    redirect_uri: str,
+    state_token: str,
+) -> str:
+    """Build Feishu authorize URL."""
+    params: dict[str, str] = {
+        "client_id": str(auth_cfg["client_id"]),
+        "redirect_uri": redirect_uri,
+        "state": state_token,
+        "response_type": "code",
+    }
+    scope = str(auth_cfg.get("scope") or "").strip()
+    if scope:
+        params["scope"] = scope
+    return f"{auth_cfg['authorize_url']}?{urlencode(params)}"
+
+
+def _extract_feishu_data(payload: Any, stage: str) -> dict[str, Any]:
+    """Normalize Feishu API response payload."""
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail=f"Feishu {stage} response is invalid")
+
+    code = payload.get("code")
+    if code not in (None, 0, "0"):
+        message = (
+            payload.get("msg")
+            or payload.get("message")
+            or payload.get("error_description")
+            or "unknown error"
+        )
+        raise HTTPException(status_code=502, detail=f"Feishu {stage} failed: {message}")
+
+    data = payload.get("data")
+    if isinstance(data, dict):
+        return data
+    return payload
+
+
+def _extract_feishu_user(data: dict[str, Any]) -> dict[str, str]:
+    """Extract key user fields from Feishu userinfo payload."""
+    source = data.get("user") if isinstance(data.get("user"), dict) else data
+    open_id = str(source.get("open_id") or "").strip()
+    user_id = str(source.get("user_id") or "").strip()
+    union_id = str(source.get("union_id") or "").strip()
+    email = str(source.get("email") or source.get("enterprise_email") or "").strip().lower()
+    name = str(source.get("name") or source.get("en_name") or "").strip()
+    avatar_url = str(
+        source.get("avatar_url")
+        or source.get("avatar_big")
+        or source.get("avatar_middle")
+        or source.get("avatar_thumb")
+        or ""
+    ).strip()
+
+    display_name = name or email or open_id or user_id or "Feishu User"
+    return {
+        "open_id": open_id,
+        "user_id": user_id,
+        "union_id": union_id,
+        "email": email,
+        "name": display_name,
+        "avatar_url": avatar_url,
+    }
+
+
+def _is_feishu_user_allowed(user: dict[str, str], auth_cfg: dict[str, Any]) -> bool:
+    """Check whether user matches optional allowlist policy."""
+    allowed_identifiers: set[str] = set(auth_cfg.get("allowed_identifiers") or set())
+    allowed_email_domains: set[str] = set(auth_cfg.get("allowed_email_domains") or set())
+
+    if not allowed_identifiers and not allowed_email_domains:
+        return True
+
+    candidates = {
+        str(user.get("open_id") or "").lower(),
+        str(user.get("user_id") or "").lower(),
+        str(user.get("union_id") or "").lower(),
+        str(user.get("email") or "").lower(),
+    }
+    candidates.discard("")
+    if allowed_identifiers and candidates.intersection(allowed_identifiers):
+        return True
+
+    email = str(user.get("email") or "").lower()
+    if allowed_email_domains and "@" in email:
+        domain = email.split("@", 1)[1]
+        if domain in allowed_email_domains:
+            return True
+
+    return False
+
+
+def _read_auth_session(request: Request, auth_cfg: dict[str, Any]) -> dict[str, Any] | None:
+    """Read and verify session cookie."""
+    if not auth_cfg.get("enabled"):
+        return {"name": "anonymous"}
+
+    secret = str(auth_cfg.get("session_secret") or "")
+    if not secret:
+        return None
+
+    raw_token = request.cookies.get(AUTH_SESSION_COOKIE, "")
+    payload = _decode_signed_payload(raw_token, secret)
+    if not payload:
+        return None
+
+    try:
+        exp = int(payload.get("exp", 0))
+    except Exception:
+        return None
+    if exp <= int(time.time()):
+        return None
+
+    user = payload.get("user")
+    return user if isinstance(user, dict) else None
+
+
+def _should_use_secure_cookie(request: Request, auth_cfg: dict[str, Any]) -> bool:
+    """Determine cookie secure flag."""
+    mode = str(auth_cfg.get("cookie_secure_mode") or "auto").lower()
+    if mode == "true":
+        return True
+    if mode == "false":
+        return False
+    return _request_scheme(request) == "https"
 
 
 def _validate_url_for_ssrf(url: str, allow_private: bool = False) -> tuple[bool, str]:
@@ -2726,6 +3012,200 @@ def create_app() -> FastAPI:
     # Mount static files
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+    auth_cfg = _load_feishu_auth_config()
+    if auth_cfg["enabled"]:
+        logger.info("Feishu login is enabled for web admin.")
+    else:
+        logger.info("Feishu login is disabled.")
+
+    auth_exempt_paths = {
+        "/auth/feishu/login",
+        "/auth/feishu/callback",
+        "/api/auth/status",
+    }
+    auth_exempt_prefixes = ("/static/",)
+
+    @app.middleware("http")
+    async def require_auth_middleware(request: Request, call_next):
+        if not auth_cfg["enabled"] or request.method.upper() == "OPTIONS":
+            return await call_next(request)
+
+        path = request.url.path or "/"
+        if path in auth_exempt_paths or any(path.startswith(prefix) for prefix in auth_exempt_prefixes):
+            return await call_next(request)
+
+        user = _read_auth_session(request, auth_cfg)
+        if user is not None:
+            request.state.auth_user = user
+            return await call_next(request)
+
+        if path.startswith("/api/"):
+            return JSONResponse(
+                status_code=401,
+                content={"error": "Authentication required", "login_url": "/auth/feishu/login"},
+            )
+
+        next_path = _sanitize_next_path(path + (f"?{request.url.query}" if request.url.query else ""))
+        return RedirectResponse(
+            url=f"/auth/feishu/login?{urlencode({'next': next_path})}",
+            status_code=307,
+        )
+
+    # =========================================================================
+    # Auth Routes
+    # =========================================================================
+
+    @app.get("/api/auth/status")
+    def get_auth_status(request: Request) -> dict[str, Any]:
+        """Return current auth status and user profile."""
+        if not auth_cfg["enabled"]:
+            return {
+                "enabled": False,
+                "authenticated": True,
+                "user": None,
+                "login_url": "/auth/feishu/login",
+            }
+
+        user = _read_auth_session(request, auth_cfg)
+        return {
+            "enabled": True,
+            "authenticated": bool(user),
+            "user": user,
+            "login_url": "/auth/feishu/login",
+        }
+
+    @app.post("/api/auth/logout")
+    def logout() -> JSONResponse:
+        """Clear local auth session cookie."""
+        response = JSONResponse({"ok": True})
+        response.delete_cookie(key=AUTH_SESSION_COOKIE, path="/")
+        return response
+
+    @app.get("/auth/feishu/login", include_in_schema=False, name="feishu_login")
+    def feishu_login(request: Request, next_path: str = Query(default="/", alias="next")) -> RedirectResponse:
+        """Start Feishu OAuth flow."""
+        if not auth_cfg["enabled"]:
+            return RedirectResponse(url="/", status_code=302)
+
+        state_payload = {
+            "ts": int(time.time()),
+            "nonce": secrets.token_urlsafe(8),
+            "next": _sanitize_next_path(next_path),
+        }
+        state_token = _encode_signed_payload(state_payload, auth_cfg["session_secret"])
+        redirect_uri = _resolve_feishu_redirect_uri(request, auth_cfg)
+        target = _build_feishu_authorize_url(auth_cfg, redirect_uri, state_token)
+        return RedirectResponse(url=target, status_code=302)
+
+    @app.get("/auth/feishu/callback", include_in_schema=False, name="feishu_callback")
+    def feishu_callback(
+        request: Request,
+        code: str | None = Query(default=None),
+        state: str | None = Query(default=None),
+        error: str | None = Query(default=None),
+        error_description: str | None = Query(default=None),
+    ) -> RedirectResponse:
+        """Handle Feishu OAuth callback and establish local session."""
+        if not auth_cfg["enabled"]:
+            return RedirectResponse(url="/", status_code=302)
+
+        if error:
+            detail = error_description or error
+            raise HTTPException(status_code=400, detail=f"Feishu authorization failed: {detail}")
+        if not code or not state:
+            raise HTTPException(status_code=400, detail="Missing Feishu callback parameters")
+
+        state_payload = _decode_signed_payload(state, auth_cfg["session_secret"])
+        if not state_payload:
+            raise HTTPException(status_code=400, detail="Invalid OAuth state")
+
+        ts = int(state_payload.get("ts", 0))
+        now_ts = int(time.time())
+        if ts <= 0 or now_ts - ts > AUTH_STATE_TTL_SECONDS:
+            raise HTTPException(status_code=400, detail="OAuth state expired")
+        next_page = _sanitize_next_path(str(state_payload.get("next") or "/"))
+
+        redirect_uri = _resolve_feishu_redirect_uri(request, auth_cfg)
+        token_body = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": auth_cfg["client_id"],
+            "client_secret": auth_cfg["app_secret"],
+            "redirect_uri": redirect_uri,
+        }
+
+        try:
+            token_resp = httpx.post(
+                auth_cfg["token_url"],
+                json=token_body,
+                timeout=15.0,
+            )
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"Feishu token request failed: {exc}") from exc
+        if not (200 <= token_resp.status_code < 300):
+            # 兼容部分环境仅接受表单编码参数。
+            try:
+                token_resp = httpx.post(
+                    auth_cfg["token_url"],
+                    data=token_body,
+                    timeout=15.0,
+                )
+            except httpx.HTTPError:
+                pass
+        if not (200 <= token_resp.status_code < 300):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Feishu token endpoint returned {token_resp.status_code}: {token_resp.text[:200]}",
+            )
+        token_payload = token_resp.json() if token_resp.content else {}
+        token_data = _extract_feishu_data(token_payload, "token exchange")
+        access_token = str(
+            token_data.get("access_token")
+            or token_data.get("user_access_token")
+            or ""
+        ).strip()
+        if not access_token:
+            raise HTTPException(status_code=502, detail="Feishu token response missing access_token")
+
+        try:
+            userinfo_resp = httpx.get(
+                auth_cfg["userinfo_url"],
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=15.0,
+            )
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"Feishu userinfo request failed: {exc}") from exc
+        if not (200 <= userinfo_resp.status_code < 300):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Feishu userinfo endpoint returned {userinfo_resp.status_code}: {userinfo_resp.text[:200]}",
+            )
+        user_payload = userinfo_resp.json() if userinfo_resp.content else {}
+        user_data = _extract_feishu_data(user_payload, "userinfo")
+        user = _extract_feishu_user(user_data)
+
+        if not _is_feishu_user_allowed(user, auth_cfg):
+            raise HTTPException(status_code=403, detail="User is not in Feishu login allowlist")
+
+        session_payload = {
+            "user": user,
+            "iat": now_ts,
+            "exp": now_ts + AUTH_SESSION_TTL_SECONDS,
+        }
+        session_token = _encode_signed_payload(session_payload, auth_cfg["session_secret"])
+
+        response = RedirectResponse(url=next_page, status_code=302)
+        response.set_cookie(
+            key=AUTH_SESSION_COOKIE,
+            value=session_token,
+            max_age=AUTH_SESSION_TTL_SECONDS,
+            httponly=True,
+            secure=_should_use_secure_cookie(request, auth_cfg),
+            samesite="lax",
+            path="/",
+        )
+        return response
 
     # =========================================================================
     # Frontend Routes

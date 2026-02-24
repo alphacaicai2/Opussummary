@@ -31,6 +31,28 @@ cp config.example.json config.json
 
 或者启动后通过 Web UI 配置：
 
+### 2.1 启用飞书登录（可选）
+
+在 `.env` 中加入以下变量即可启用 Web 管理端飞书登录：
+
+```bash
+FEISHU_LOGIN_ENABLED=true
+FEISHU_CLIENT_ID=cli_xxx
+FEISHU_APP_SECRET=xxxx
+FEISHU_SESSION_SECRET=请填写长度足够的随机字符串
+# 兼容旧命名：FEISHU_APP_ID（如同时存在，优先读取 FEISHU_CLIENT_ID）
+# 可选：固定回调地址（不填则自动按请求域名拼接 /auth/feishu/callback）
+# FEISHU_REDIRECT_URI=https://smart.vibexcap.com/auth/feishu/callback
+# 可选：限制允许登录的用户（支持 open_id/user_id/union_id/email）
+# FEISHU_ALLOWED_IDENTIFIERS=alice@vibexcap.com,bob@vibexcap.com
+# 可选：按邮箱域名限制
+# FEISHU_ALLOWED_EMAIL_DOMAINS=vibexcap.com
+```
+
+飞书开放平台里需要把回调地址配置为：
+
+`https://smart.vibexcap.com/auth/feishu/callback`
+
 ### 3. 运行
 
 ```bash

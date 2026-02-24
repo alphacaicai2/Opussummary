@@ -52,6 +52,12 @@
                     <span id="connection-status" class="px-3 py-1 rounded-full text-xs font-medium bg-yellow-500/20 text-yellow-400">
                         检查连接中...
                     </span>
+                    <div id="auth-panel" class="hidden items-center space-x-3">
+                        <span id="auth-user-name" class="text-xs text-gray-300"></span>
+                        <button onclick="logout()" class="px-3 py-1 rounded-lg text-xs bg-gray-700 hover:bg-gray-600 transition-colors">
+                            退出登录
+                        </button>
+                    </div>
                 </div>
             </div>
         </header>
@@ -571,6 +577,12 @@
         // State
         let state = {
             settings: {},
+            auth: {
+                enabled: false,
+                authenticated: true,
+                user: null,
+                login_url: '/auth/feishu/login'
+            },
             llmConfigs: [],
             webhooks: [],
             templates: [],
@@ -579,10 +591,68 @@
             briefings: []
         };
 
+        function getCurrentPathForLogin() {
+            const path = window.location.pathname || '/';
+            const query = window.location.search || '';
+            const hash = window.location.hash || '';
+            return `${path}${query}${hash}`;
+        }
+
+        function buildLoginUrl(baseUrl) {
+            const loginBase = baseUrl || '/auth/feishu/login';
+            const separator = loginBase.includes('?') ? '&' : '?';
+            return `${loginBase}${separator}next=${encodeURIComponent(getCurrentPathForLogin())}`;
+        }
+
+        function renderAuthPanel() {
+            const panel = document.getElementById('auth-panel');
+            const nameEl = document.getElementById('auth-user-name');
+            if (!state.auth.enabled || !state.auth.authenticated || !state.auth.user) {
+                panel.classList.add('hidden');
+                panel.classList.remove('flex');
+                nameEl.textContent = '';
+                return;
+            }
+            const displayName = state.auth.user.name || state.auth.user.email || '已登录';
+            nameEl.textContent = `飞书：${displayName}`;
+            panel.classList.remove('hidden');
+            panel.classList.add('flex');
+        }
+
+        async function loadAuthStatus() {
+            try {
+                const response = await fetch('/api/auth/status', { credentials: 'same-origin' });
+                if (!response.ok) {
+                    throw new Error('获取登录状态失败');
+                }
+                state.auth = await response.json();
+                renderAuthPanel();
+
+                if (state.auth.enabled && !state.auth.authenticated) {
+                    window.location.href = buildLoginUrl(state.auth.login_url);
+                    return false;
+                }
+                return true;
+            } catch (e) {
+                console.error('Failed to load auth status:', e);
+                return true;
+            }
+        }
+
+        async function logout() {
+            try {
+                await api('/api/auth/logout', { method: 'POST' });
+            } catch (_) {
+                // 忽略登出接口异常，直接跳转登录页。
+            }
+            window.location.href = buildLoginUrl(state.auth.login_url);
+        }
+
         // API Helper
         async function api(endpoint, options = {}) {
             const response = await fetch(endpoint, {
                 ...options,
+                credentials: 'same-origin',
                 headers: {
                     'Content-Type': 'application/json',
                     ...options.headers
@@ -591,6 +661,10 @@
             });
             if (!response.ok) {
                 const error = await response.json().catch(() => ({ error: 'Request failed' }));
+                if (response.status === 401) {
+                    window.location.href = buildLoginUrl(error.login_url || state.auth.login_url);
+                    throw new Error('登录状态已失效，正在跳转飞书登录');
+                }
                 let message = error.error || 'Request failed';
                 if (Array.isArray(error.detail)) {
                     const first = error.detail[0];
@@ -2054,6 +2128,9 @@
 
         // Initialize
         async function init() {
+            const authReady = await loadAuthStatus();
+            if (!authReady) return;
+
             await loadSettings();
             await loadLLMConfigs();
             await loadWebhooks();
