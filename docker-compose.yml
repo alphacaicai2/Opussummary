@@ -11,10 +11,33 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - WEB_PORT=8812
-    networks:
-      - default
-      - relay
-networks:
-  relay:
-    external: true
-    name: opus_default
+    depends_on:
+      opus-relay:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8812/api/auth/status', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  opus-relay:
+    build: ./relay
+    container_name: opus-relay
+    restart: unless-stopped
+    stop_grace_period: 120s
+    volumes:
+      - type: bind
+        source: ./relay/config.json
+        target: /app/config.json
+        bind:
+          create_host_path: false
+      - ./relay/data:/app/data
+    environment:
+      - TZ=Asia/Shanghai
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/api/config', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

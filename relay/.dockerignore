@@ -1,7 +1,6 @@
 .git
-.env
-.env.*
+.env*
+config.json
 data
 __pycache__
 *.pyc
-relay

@@ -15,10 +15,10 @@ import web.server as server
 async def noop(app):
     yield
 
-@unittest.skipUnless(os.getenv('RELAY_TEST_SOURCE'), 'Run with the Relay source mounted read-only')
 class RelaySaveIntegration(unittest.TestCase):
     def test_save_reload_readback_and_invalid_payload(self):
-        spec = importlib.util.spec_from_file_location('relay_fixture', os.environ['RELAY_TEST_SOURCE'])
+        source = os.getenv('RELAY_TEST_SOURCE') or str(Path(__file__).resolve().parents[1] / 'relay' / 'web_server.py')
+        spec = importlib.util.spec_from_file_location('relay_fixture', source)
         relay = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(relay)
         original_client = httpx.AsyncClient

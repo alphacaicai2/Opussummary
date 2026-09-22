@@ -1,0 +1,16 @@
+{
+  "miniflux_url": "https://miniflux.example.com",
+  "miniflux_token": "your_miniflux_api_token",
+  "poll_interval_minutes": 15,
+  "batch_interval_seconds": 120,
+  "batch_max_items": 15,
+  "timezone": "Asia/Shanghai",
+  "content_summary_length": 300,
+  "categories_with_content": [],
+  "translation": {
+    "base_url": "",
+    "api_key": "",
+    "model": "gpt-4o-mini"
+  },
+  "routes": {}
+}
