@@ -12,6 +12,8 @@ FastAPI-based REST API server for managing:
 from __future__ import annotations
 
 import json
+import asyncio
+import websockets
 import logging
 import os
 import sqlite3
@@ -29,7 +31,7 @@ from urllib.parse import urlencode
 from uuid import uuid4
 
 import httpx
-from fastapi import Body, FastAPI, HTTPException, Query, Request
+from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -776,27 +778,34 @@ def _load_feishu_auth_config() -> dict[str, Any]:
     Load Feishu login configuration from environment variables.
 
     FEISHU_LOGIN_ENABLED:
-    - empty: auto-enable when CLIENT_ID + APP_SECRET are set
+    - empty: enabled by default; missing credentials prevent startup
     - true/false: explicit override
     """
     client_id = (os.getenv("FEISHU_CLIENT_ID", "") or os.getenv("FEISHU_APP_ID", "")).strip()
     app_secret = os.getenv("FEISHU_APP_SECRET", "").strip()
     enabled_raw = os.getenv("FEISHU_LOGIN_ENABLED")
-    enabled = _is_truthy(enabled_raw) if enabled_raw is not None else bool(client_id and app_secret)
+    enabled_value = (enabled_raw or "true").strip().lower() or "true"
+    if enabled_value not in {"true", "1", "yes", "on", "false", "0", "no", "off"}:
+        raise RuntimeError("Invalid FEISHU_LOGIN_ENABLED value; refusing to disable authentication")
+    enabled = _is_truthy(enabled_value)
 
     if enabled and (not client_id or not app_secret):
-        logger.error(
-            "Feishu login is enabled but FEISHU_CLIENT_ID(or FEISHU_APP_ID)/FEISHU_APP_SECRET is missing; disabling auth."
-        )
-        enabled = False
+        raise RuntimeError("Feishu login credentials are missing; refusing to start an unprotected admin server")
 
     session_secret = (os.getenv("FEISHU_SESSION_SECRET", "") or os.getenv("WEB_SESSION_SECRET", "")).strip()
     if enabled and not session_secret:
-        # 允许服务启动，但会在重启后使已登录会话失效。
-        session_secret = secrets.token_urlsafe(48)
-        logger.warning(
-            "FEISHU_SESSION_SECRET is not set; using ephemeral secret. Sessions will be invalidated after restart."
-        )
+        secret_path = DATA_DIR / ".web-session-secret"
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(secret_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(fd, "w") as secret_file:
+                secret_file.write(secrets.token_urlsafe(48))
+        session_secret = secret_path.read_text().strip()
+        if not session_secret:
+            raise RuntimeError("Persistent web session secret is empty")
 
     cookie_secure_mode = (os.getenv("FEISHU_COOKIE_SECURE", "auto") or "auto").strip().lower()
     if cookie_secure_mode not in {"auto", "true", "false"}:
@@ -1372,6 +1381,18 @@ class LLMConfigCreate(LLMConfigBase):
     pass
 
 
+class LLMConfigUpdate(BaseModel):
+    """Model for updating an LLM configuration without re-entering its API key."""
+    name: str = Field(..., min_length=1, max_length=100)
+    provider: str = Field(..., min_length=1, max_length=50)
+    base_url: str = Field(..., min_length=1)
+    api_key: str | None = Field(default=None, min_length=1)
+    model: str = Field(..., min_length=1)
+    max_tokens: int | None = Field(default=None, ge=1)
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    is_default: bool = False
+
+
 class LLMConfigOut(BaseModel):
     """Model for LLM configuration output (API key masked for security)."""
     id: int
@@ -1594,6 +1615,14 @@ class LLMTestRequest(BaseModel):
     base_url: str | None = Field(default=None, description="Override base URL")
     api_key: str | None = Field(default=None, description="Override API key")
     model: str | None = Field(default=None, description="Override model name")
+
+
+class LLMModelsRequest(BaseModel):
+    """Model discovery request using entered credentials or a saved configuration."""
+    llm_config_id: int | None = Field(default=None, description="Saved configuration used for its API key")
+    provider: str | None = Field(default=None, description="Provider ID for authentication headers")
+    base_url: str | None = Field(default=None, description="API base URL")
+    api_key: str | None = Field(default=None, description="API key; may be omitted when editing a saved config")
 
 
 class WebhookTestRequest(BaseModel):
@@ -2818,7 +2847,7 @@ def test_llm_connection(payload: LLMTestRequest) -> dict[str, Any]:
     if payload.llm_config_id is not None:
         with _get_conn() as conn:
             row = conn.execute(
-                "SELECT base_url, api_key, model FROM llm_configs WHERE id = ?",
+                "SELECT provider, base_url, api_key, model FROM llm_configs WHERE id = ?",
                 (payload.llm_config_id,),
             ).fetchone()
         if row is None:
@@ -2833,39 +2862,117 @@ def test_llm_connection(payload: LLMTestRequest) -> dict[str, Any]:
     if not base_url or not api_key:
         raise HTTPException(status_code=400, detail="Either llm_config_id or base_url + api_key required")
 
-    # Test connection
-    headers = {"Authorization": f"Bearer {api_key}"}
+    provider = row['provider'] if payload.llm_config_id is not None else 'custom'
+    headers = _build_provider_headers(provider, api_key)
     models_url = f"{base_url.rstrip('/')}/models"
 
     try:
         # Try /models endpoint first
-        resp = httpx.get(models_url, headers=headers, timeout=15.0)
-        if 200 <= resp.status_code < 300:
-            return {"success": True, "status_code": resp.status_code, "detail": "Models endpoint OK"}
+        try:
+            resp = httpx.get(models_url, headers=headers, timeout=15.0)
+            models_ok = 200 <= resp.status_code < 300
+        except httpx.HTTPError:
+            models_ok = False
 
         # If models fails, try a simple chat completion
         if model:
-            chat_url = f"{base_url.rstrip('/')}/chat/completions"
+            anthropic = provider == 'anthropic'
+            chat_url = f"{base_url.rstrip('/')}/{'messages' if anthropic else 'chat/completions'}"
             probe = httpx.post(
                 chat_url,
                 headers=headers,
                 json={
                     "model": model,
                     "messages": [{"role": "user", "content": "ping"}],
-                    "max_tokens": 1,
+                    "max_tokens": 16,
                 },
                 timeout=20.0,
             )
-            ok = 200 <= probe.status_code < 300
+            ok = False
+            if 200 <= probe.status_code < 300:
+                body = probe.json()
+                ok = isinstance(body, dict) and bool(body.get('content') if anthropic else body.get('choices'))
             return {
                 "success": ok,
                 "status_code": probe.status_code,
-                "detail": probe.text[:300],
+                "models_available": models_ok,
+                "detail": ("模型列表可获取；" if models_ok else "模型列表不可获取；") + ("所选模型调用成功" if ok else f"所选模型调用失败（HTTP {probe.status_code}）"),
             }
 
-        return {"success": False, "status_code": resp.status_code, "detail": resp.text[:300]}
+        return {"success": False, "status_code": 0, "detail": "请指定需要测试的模型"}
+    except (httpx.HTTPError, ValueError) as exc:
+        return {"success": False, "status_code": 0, "detail": f"模型测试失败：{type(exc).__name__}"}
+
+
+def fetch_llm_models(payload: LLMModelsRequest) -> dict[str, Any]:
+    """Fetch model IDs from an OpenAI-compatible (or Anthropic) models endpoint."""
+    provider = (payload.provider or "custom").strip().lower()
+    base_url = (payload.base_url or "").strip()
+    api_key = (payload.api_key or "").strip()
+
+    if payload.llm_config_id is not None:
+        with _get_conn() as conn:
+            row = conn.execute(
+                "SELECT provider, base_url, api_key FROM llm_configs WHERE id = ?",
+                (payload.llm_config_id,),
+            ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"LLM config not found: {payload.llm_config_id}")
+        if not api_key and base_url and base_url.rstrip('/') != str(row['base_url']).strip().rstrip('/'):
+            raise HTTPException(status_code=400, detail="更换 Base URL 后请重新填写 API Key")
+        provider = (payload.provider or row["provider"] or "custom").strip().lower()
+        base_url = base_url or str(row["base_url"] or "").strip()
+        api_key = api_key or str(row["api_key"] or "").strip()
+
+    if not base_url or not api_key:
+        raise HTTPException(status_code=400, detail="请填写 Base URL 和 API Key")
+    if not base_url.startswith(("https://", "http://")):
+        raise HTTPException(status_code=400, detail="Base URL 必须以 http:// 或 https:// 开头")
+
+    try:
+        response = httpx.get(
+            f"{base_url.rstrip('/')}/models",
+            headers=_build_provider_headers(provider, api_key),
+            timeout=15.0,
+        )
     except httpx.HTTPError as exc:
-        return {"success": False, "status_code": 0, "detail": str(exc)}
+        raise HTTPException(status_code=502, detail=f"连接模型接口失败：{exc.__class__.__name__}") from exc
+
+    if not 200 <= response.status_code < 300:
+        suffix = {401: "：API Key 无效或已过期", 403: "：没有访问权限", 402: "：账户余额不足", 404: "：不支持模型列表接口，可手动填写", 429: "：请求过于频繁，请稍后重试"}.get(response.status_code, "")
+        raise HTTPException(status_code=502, detail=f"模型接口返回 HTTP {response.status_code}{suffix}")
+
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="模型接口未返回有效 JSON") from exc
+
+    candidates: Any = body
+    if isinstance(body, dict):
+        for key in ("data", "models", "items"):
+            if isinstance(body.get(key), list):
+                candidates = body[key]
+                break
+
+    models: list[str] = []
+    seen: set[str] = set()
+    if isinstance(candidates, list):
+        for item in candidates:
+            if isinstance(item, str):
+                model_id = item.strip()
+            elif isinstance(item, dict):
+                model_id = str(item.get("id") or item.get("model") or item.get("name") or "").strip()
+            else:
+                model_id = ""
+            if model_id and model_id not in seen:
+                seen.add(model_id)
+                models.append(model_id)
+            if len(models) >= 1000:
+                break
+
+    if not models:
+        raise HTTPException(status_code=502, detail="模型接口连接成功，但没有识别到模型列表")
+    return {"models": models, "count": len(models)}
 
 
 def test_miniflux_connection(payload: MinifluxTestRequest) -> dict[str, Any]:
@@ -3289,6 +3396,73 @@ def create_app() -> FastAPI:
     # Frontend Routes
     # =========================================================================
 
+    @app.get("/relay", include_in_schema=False)
+    def relay_page() -> FileResponse:
+        return FileResponse(STATIC_DIR / "relay.html", headers={"Cache-Control": "no-store"})
+
+    @app.api_route("/api/relay/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+    async def relay_api(path: str, request: Request) -> Response:
+        # Keep upstream fixed; never forward browser cookies or authorization.
+        if request.method != "GET" and request.headers.get("origin") not in (None, "https://" + request.headers.get("host", ""), "http://" + request.headers.get("host", "")):
+            raise HTTPException(status_code=403, detail="Cross-origin request rejected")
+        if ".." in path.split("/") or "\\" in path:
+            raise HTTPException(status_code=400, detail="Invalid path")
+        try:
+            async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
+                upstream = await client.request(
+                    request.method, "http://opus-relay:8090/api/" + path,
+                    params=request.query_params, content=await request.body(),
+                    headers={"Content-Type": request.headers.get("content-type", "application/json")},
+                )
+            return Response(upstream.content, status_code=upstream.status_code,
+                            headers={"Content-Type": upstream.headers.get("content-type", "application/json"),
+                                     "Cache-Control": "no-store"})
+        except httpx.RequestError:
+            raise HTTPException(status_code=502, detail="Relay 服务暂时无法连接")
+
+    @app.websocket("/api/relay/ws/logs")
+    async def relay_logs(ws: WebSocket):
+        # HTTP middleware does not cover WebSockets: validate the same session here.
+        if auth_cfg["enabled"] and _read_auth_session(ws, auth_cfg) is None:
+            await ws.close(code=1008)
+            return
+        origin = ws.headers.get("origin")
+        if origin and origin not in ("https://" + ws.headers.get("host", ""), "http://" + ws.headers.get("host", "")):
+            await ws.close(code=1008)
+            return
+        await ws.accept()
+        async def receive_close():
+            while True:
+                message = await ws.receive()
+                if message["type"] == "websocket.disconnect":
+                    return
+        async def forward(upstream):
+            async for message in upstream:
+                if auth_cfg["enabled"] and _read_auth_session(ws, auth_cfg) is None:
+                    await ws.close(code=1008)
+                    return
+                await ws.send_text(message)
+        async def expire_session():
+            while True:
+                await asyncio.sleep(10)
+                if auth_cfg["enabled"] and _read_auth_session(ws, auth_cfg) is None:
+                    await ws.close(code=1008, reason="Session expired")
+                    return
+        tasks = []
+        try:
+            async with websockets.connect("ws://opus-relay:8090/ws/logs") as upstream:
+                tasks = [asyncio.create_task(receive_close()), asyncio.create_task(forward(upstream)), asyncio.create_task(expire_session())]
+                await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        except Exception:
+            try:
+                await ws.close(code=1011)
+            except RuntimeError:
+                pass
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     @app.get("/", include_in_schema=False)
     def index() -> FileResponse:
         """Serve frontend index page."""
@@ -3371,13 +3545,16 @@ def create_app() -> FastAPI:
         return {"ok": True, "id": config_id}
 
     @app.put("/api/llm-configs/{config_id}", response_model=LLMConfigOut)
-    def update_llm_config(config_id: int, payload: LLMConfigCreate) -> LLMConfigOut:
+    def update_llm_config(config_id: int, payload: LLMConfigUpdate) -> LLMConfigOut:
         """Update an existing LLM configuration."""
         now = _utcnow_iso()
         with _get_conn() as conn:
-            exists = conn.execute("SELECT 1 FROM llm_configs WHERE id = ?", (config_id,)).fetchone()
+            exists = conn.execute("SELECT api_key, base_url FROM llm_configs WHERE id = ?", (config_id,)).fetchone()
             if not exists:
                 raise HTTPException(status_code=404, detail=f"LLM config not found: {config_id}")
+
+            if not payload.api_key and payload.base_url.strip().rstrip('/') != exists['base_url'].strip().rstrip('/'):
+                raise HTTPException(status_code=400, detail="更换 Base URL 后请重新填写 API Key")
 
             # 如果设置为默认，先清除其他默认标记
             if payload.is_default:
@@ -3395,7 +3572,7 @@ def create_app() -> FastAPI:
                     payload.name,
                     payload.provider,
                     payload.base_url,
-                    payload.api_key,
+                    payload.api_key or str(exists["api_key"]),
                     payload.model,
                     payload.max_tokens,
                     payload.temperature,
@@ -4056,6 +4233,11 @@ def create_app() -> FastAPI:
     def api_test_llm(payload: LLMTestRequest) -> dict[str, Any]:
         """Test LLM connection."""
         return test_llm_connection(payload)
+
+    @app.post("/api/llm-models")
+    def api_fetch_llm_models(payload: LLMModelsRequest) -> dict[str, Any]:
+        """Fetch available model IDs using unsaved or stored credentials."""
+        return fetch_llm_models(payload)
 
     @app.post("/api/test/webhook")
     def api_test_webhook(payload: WebhookTestRequest) -> dict[str, Any]:

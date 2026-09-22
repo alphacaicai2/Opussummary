@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   opusbrief:
     build: .
@@ -13,3 +11,10 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - WEB_PORT=8812
+    networks:
+      - default
+      - relay
+networks:
+  relay:
+    external: true
+    name: opus_default
